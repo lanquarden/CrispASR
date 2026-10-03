@@ -281,7 +281,7 @@ struct BankFacts {
 //                            when the backend selects voices by name from one.
 inline CloneDecision classify(const std::string& voice, bool baked_from_wav_this_run, bool pack_declares_clone,
                               const std::string& pack_architecture = std::string(),
-                              const BankFacts& bank = BankFacts()) {
+                              const BankFacts& bank = BankFacts(), bool pack_synthetic_source = false) {
     CloneDecision d;
     if (voice.empty())
         return d;
@@ -303,9 +303,16 @@ inline CloneDecision classify(const std::string& voice, bool baked_from_wav_this
         d.reason = "pack-provenance";
         return d;
     }
-    // Legacy fallback: no stamp, but the producer named by the pack's
-    // architecture only ever bakes from a recording.
-    if (architecture_is_recording_derived(pack_architecture)) {
+    // FORK-LOCAL (lanquarden/CrispASR, deploy/0.8.40-synthetic-provenance):
+    // a pack whose ENTIRE provenance is a fully synthetic take of a designed
+    // persona (source == "voicedesign-synthetic", stamped by our own baker,
+    // identity declared synthetic, not derived from any recording of a
+    // person) is a preset, not a clone. This deliberately trusts the baker's
+    // declaration and is INTENTIONALLY NOT UPSTREAMED: upstream cannot
+    // distinguish an honest synthetic-source baker from one mislabeling a
+    // real recording, so the conservative architecture fallback must stay.
+    // Only deploy/0.8.40-synthetic-provenance honors it.
+    if (!pack_synthetic_source && architecture_is_recording_derived(pack_architecture)) {
         d.is_clone = true;
         d.reason = "pack-architecture";
         return d;

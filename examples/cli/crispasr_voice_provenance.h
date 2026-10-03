@@ -36,6 +36,11 @@ struct PackProvenance {
     // declares_clone: a pack can be a non-clone preset and still be a real
     // person, which is the whole reason this field exists.
     SpeakerIdentity identity = SpeakerIdentity::Unknown;
+    // FORK-LOCAL (deploy/0.8.40-synthetic-provenance): truthful provenance for
+    // fully-synthetic persona packs. Honored by classify() only when it is
+    // exactly "voicedesign-synthetic" (and not a clone, and identity is
+    // synthetic); intentionally not upstreamed — see classify() there.
+    std::string source;
 };
 
 // Read both provenance signals in ONE metadata open. Returns an empty result
@@ -54,6 +59,11 @@ inline PackProvenance read_pack_provenance(const std::string& path) {
     p.declares_clone = core_gguf::kv_bool(meta, provenance_key(), false);
     p.architecture = core_gguf::kv_str(meta, "general.architecture", "");
     p.identity = parse_speaker_identity(core_gguf::kv_str(meta, speaker_identity_key(), ""));
+    // FORK-LOCAL (deploy/0.8.40-synthetic-provenance): see classify() in
+    // crispasr_voice_clone_policy.h. Only the exact synthetic-source string
+    // written by our own baker is honored, and only together with a false
+    // clone stamp and a synthetic identity declaration.
+    p.source = core_gguf::kv_str(meta, "crispasr.voice.source", "");
     core_gguf::free_metadata(meta);
     return p;
 }
@@ -215,7 +225,9 @@ inline CloneDecision classify_voice(const std::string& voice, const std::string&
     // would let an unrelated bundle's metadata classify someone else's file.
     const bool is_bank_entry = !bank_path.empty() && !is_voice_pack(resolved) && !is_recording_reference(resolved);
     const BankFacts bank = is_bank_entry ? read_bank_provenance(bank_path, resolved) : BankFacts();
-    CloneDecision d = classify(resolved, baked_from_wav_this_run, p.declares_clone, p.architecture, bank);
+    CloneDecision d = classify(resolved, baked_from_wav_this_run, p.declares_clone, p.architecture, bank,
+                               /*pack_synthetic_source=*/!p.source.empty() && p.source == "voicedesign-synthetic" &&
+                                   !p.declares_clone && p.identity == SpeakerIdentity::Synthetic);
     // Whichever source actually described this voice is the one that can speak
     // for its identity: a bank entry's own key, else the pack's.
     d.pack_identity = is_bank_entry ? bank.identity : p.identity;
