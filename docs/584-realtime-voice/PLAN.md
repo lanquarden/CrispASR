@@ -1,7 +1,10 @@
 # 584 — Realtime voice loop in CrispASR
 
 Tracking: home-ops#584 (parent voice workstream #278). Branch:
-`feat/584-realtime-voice`. Status: **M0 (plan + co-residency spike)**.
+`feat/584-realtime-voice`, based on **v0.8.51** (latest release) with the
+fork-local synthetic-provenance patch cherry-picked on top. The deployed
+containers stay on 0.8.40; the experiment is upstream-clean so the branch can
+become a PR.
 
 Experiment, not a deployment. Judged by measured numbers from an automated
 harness, not by ear. Upstream-clean: new files only, no edits to existing
@@ -72,6 +75,15 @@ Priority rules: a TTS chunk is urgent when `buffer_ms < LOW_WATER`; ASR partials
 are dropped if a newer partial exists or speech ended; LLM work is
 deadline-free but must never starve TTS.
 
+Priorities are only meaningful at job boundaries — no inference call is
+preemptible. Two hard rules follow (review finding #2):
+
+- Every job class is bounded. ASR partials decode at most the last 6 s. TTS
+  input is committed in pieces of <= ~6 words (~0.4 s of audio) so one
+  `synthesize_streaming` call is a few hundred ms, not seconds of audio.
+- The arbiter records `block_ms` per job; M1 fails if any TTS job blocks longer
+  than 400 ms or any partial longer than 250 ms.
+
 ### Module layout (all new)
 
 ```
@@ -112,7 +124,15 @@ Events: `SPEECH_START`, `PARTIAL`, `SPEECH_END`, `FINAL`, `TASK_RESULT`,
 `TASK_FAIL`, `TTS_CHUNK_READY`, `PLAYBACK_LOW`, `BARGE_IN`, `TICK`.
 
 `BARGE_IN` is emitted by the capture path when speech is detected while
-`played_ms > 0` and the assistant owns the floor.
+`played_ms > 0` and the assistant owns the floor. Additions required by review:
+
+- `DELEGATING --SPEECH_START--> LISTENING` — a follow-up question spoken while
+  the task runs takes the floor; the old task keeps running and its result is
+  dropped if the new turn does not reference it (explicit rule, tested).
+- `TASK_RESULT` arriving after its turn was abandoned is dropped and counted
+  (`stale_results_dropped`), never spoken into a later conversation.
+- `answer` entries carry `expiry_ms`; an expired answer is dropped, not spoken
+  late.
 
 ## Scheduler policy (defaults, configurable)
 
@@ -135,19 +155,44 @@ Text queue entries carry `kind` (ack/filler/answer/clarify), `expiry_ms`, and
 `seq`. The sequencer drops stale fillers before they reach TTS. Fillers are
 never repeated within a session (bank index + recently-used set).
 
-Handoff: answer arrival marks all pending fillers stale, lets the current
-clause finish, then commits the answer. Barge-in flushes PCM, aborts the LLM
-generation via `crispasr_chat_set_abort_callback`, and cancels the task only
-when the turn is abandoned (cancel is explicit, never implicit on timeout).
+Handoff (revised after review #4): answer arrival does **not** stop filler
+immediately — the answer still needs LLM TTFT plus TTS TTFA to produce its
+first PCM. Filler keeps flowing until the answer's first clause is buffered to
+`target_water_ms`; only then queued fillers are dropped. The answer prompt is
+conditioned on the filler text actually spoken, so the transition reads as
+continuation, not as a restart. Barge-in flushes PCM, aborts the LLM generation
+via `crispasr_chat_set_abort_callback`, lets the in-flight <=0.4 s TTS piece
+finish (the vtable has no abort flag; adding one is a separate small upstream
+PR), and cancels the task only when the turn is abandoned.
 
 ## Partial transcripts
 
 Qwen3-ASR does not implement native cross-append streaming
 (`transcribe_streaming` falls back to one final result), so the STT driver owns
-partials: while speech is active it re-transcribes the accumulated speech buffer
-(minus trailing silence) every `stt_partial_ms`, emits the common prefix once
-and a delta after that. Partials are advisory; only the final transcript may
-trigger a tool call or an ack.
+partials: while speech is active it re-transcribes a **sliding last-6 s window**
+every `stt_partial_ms`. Review #5 is right that a growing buffer is quadratic
+and that re-decoding revises words — so partials are advisory only, never a
+diff base: the driver emits the latest text and a monotonic timestamp, and the
+speculator may only use words that have been stable across two consecutive
+decodes. Only the final transcript may trigger a tool call or an ack. Cadence
+is gated by measured `asr_partial_cost_ms` (skip a tick rather than queue).
+
+## Stage budget (M0 must fill this in before M1 starts)
+
+| stage | measured by | budget (p50) |
+|---|---|---|
+| end of speech -> final transcript | harness | <= 200 ms |
+| final -> ack text (LLM TTFT) | harness | <= 150 ms |
+| ack text -> first PCM (TTS TTFA) | M0 spike | **to be measured** |
+| PCM -> first played frame | harness | <= 30 ms |
+
+Review #1 blocks the headline target until the TTS TTFA is real: qwen3-tts
+reports ~1 s time-to-first-audio in the backend comment, which would make
+`eos_to_first_played <= 700 ms` impossible. M0 measures TTFA at the real
+chunk size. The M1 target is then **the measured sum + 15 %**, published in
+this file together with the measurement, not a number invented in advance.
+If TTFA exceeds ~400 ms, the ack is shortened to its first clause and the
+measured budget becomes the target.
 
 ## Metrics (JSONL, one record per turn)
 
@@ -176,14 +221,16 @@ Assertions live in `tests/voice/check_metrics.py` (no human in the loop).
 
 ## Milestones
 
-**M0 — plan + co-residency spike.** One process: ASR + TTS backends + chat
-session, sequential and (probe only) two-thread. Report VRAM/RSS, per-call
-times. Verdict on the arbiter design. Exit: spike log committed under
-`docs/584-realtime-voice/spike/`.
+**M0 — plan + co-residency spike + stage budget.** One process: ASR + TTS
+backends + chat session, sequential and (probe only) two-thread. Report
+VRAM/RSS, per-call times, **TTS TTFA at the real chunk size**, ASR final decode
+for a 3 s utterance, chat TTFT. Fill the stage-budget table. Verdict on the
+arbiter design. Exit: spike log committed under `docs/584-realtime-voice/spike/`.
 
 **M1 — the loop, canned filler.** Harness scenarios 1–4 pass; barge-in stops
-playback; metrics emitted. Targets: ack first audio p50 ≤ 700 ms / p95 ≤ 1200 ms;
-no gap > 150 ms during `delegation`; barge-in stop ≤ 250 ms.
+playback; metrics emitted. Targets: the **measured** stage budget from M0
+(headline p50/p95 restated from it); no gap > 150 ms during `delegation`;
+barge-in stop <= 250 ms; no stage overruns real time.
 
 **M2 — LLM filler + starvation instrumentation.** Filler bank behind the same
 interface as LLM filler; sweep low/high water and partial cadence; report table
@@ -199,8 +246,16 @@ consolidated).
 - **Vulkan concurrency / VRAM spikes** → single arbiter; spike measures it.
 - **Chat re-prefill cost** between filler and answer channels → measure tokens/s
   and TTFT per channel switch; fall back to a second session sharing weights.
-- **TTS inter-sentence 200 ms pad** (server-side chunking) → add a flag, default
-  unchanged; the loop sets it to 0.
+- **TTS inter-sentence pad**: review #9 is correct — the 200 ms pad lives in the
+  server's chunking path, which the loop does not use. The sequencer owns
+  inter-clause gaps; no server change is needed.
+- **Echo**: with a real mic the loop hears its own TTS and fires `BARGE_IN`
+  continuously. Mitigation: gate VAD while the assistant holds the floor and no
+  user speech is plausible, plus a self-echo scenario in the harness.
+- **Harness honesty**: WAV sink has no device latency. Warm-up runs are
+  excluded, N >= 5 per scenario for p50/p95, a stage that overruns real time
+  fails the scenario instead of silently compressing the timeline, and one
+  scenario runs through a paced sink with an artificial device buffer.
 - **qwen3-tts TTFA** is chunked (~1 s) → verify actual first-chunk latency in
   M0; if it exceeds the ack target, the ack clause gets shortened and the
   target is restated per-stage.
@@ -208,18 +263,32 @@ consolidated).
   upstream build would require consent + spoken disclosure. Do not build the
   experiment on the upstream consent path.
 - **Thermals**: 20 GB card also drives the desktop; measure, don't assume.
+- **Upstream debt** (review #10): the loop needs only two shared-surface
+  changes — an abort flag on `synthesize_streaming` (barge-in mid-piece) and a
+  grammar hook for chat tool calls. Both are small, separate PRs to the
+  upstream vtable/ABI; do not bundle them into this experiment.
+
+## Review
+
+`zai/glm-5.3-flash` reviewed this plan before any code (findings 1-10 above are
+incorporated). Re-review at each milestone boundary; the reviewer is prompted
+to refute the numbers, not to approve them.
 
 ## Reproduction
 
 ```
-# toolchain (host): cmake>=3.31 (<4 required by the vendored Vulkan shaders),
-# ninja, glslc, libvulkan, spirv-headers (brew), openblas
+# toolchain (host): cmake 3.31 (<4: the vendored Vulkan shaders reject it),
+# ninja, glslc, libvulkan, vulkan-headers, spirv-headers (brew), openblas
+# The cached build expects the Vulkan headers under /tmp/sdk/include:
+#   /tmp/sdk/include/{vulkan,vk_video,spirv}
 cmake -S . -B build-vk -G Ninja -DCMAKE_MAKE_PROGRAM=/usr/bin/ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DSPIRV-Headers_DIR=$(brew --prefix spirv-headers)/share/cmake/SPIRV-Headers
 ninja -C build-vk bin/crispasr-voice
 build-vk/bin/crispasr-voice --harness tests/voice/scenarios/delegation.json
 ```
+
+Base: `v0.8.51` + fork patch `8e09becac` (synthetic-provenance voicepacks).
 
 Models: ASR/TTS from the deployed podman volume, chat LLM from
 `~/models/Qwen3-0.6B-GGUF/`.
