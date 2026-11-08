@@ -1,0 +1,16 @@
+{
+  "name": "toolcall_valid_real",
+  "input": "question_real.wav",
+  "transcript": "is the garage door closed?",
+  "task_ms": 6000,
+  "task_fail_percent": 0,
+  "runs": 2,
+  "warmup": 1,
+  "tool_mode": "fake_valid",
+  "expect": {
+    "max_gap_ms": 150,
+    "min_filler_played": 1,
+    "answer_played": true,
+    "max_task_dispatches": 1
+  }
+}

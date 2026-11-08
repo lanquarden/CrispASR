@@ -44,11 +44,12 @@ struct ToolCall {
     std::string raw;      // model output as received (empty in --tool-mode off)
 };
 
-// Lenient parse of one model reply. Accepts: a bare tool name, a JSON object
-// wrapped in markdown fences, a JSON object with prose around it, a JSON object
-// inside a JSON string, and numeric strings for `minutes`. Rejects: no object
-// and no bare name, an unterminated object, an unknown tool, wrong argument
-// types, out-of-range values.
+// Lenient parse of one model reply. Accepts: a JSON object wrapped in markdown
+// fences, a JSON object with prose around it, a JSON object inside a JSON
+// string, and numeric strings for `minutes`. Rejects: no object and no bare
+// name, an unterminated object, an unknown tool, wrong argument types,
+// out-of-range values, and a bare tool name with no arguments (the name alone
+// does not carry a decision).
 ToolCall parse_tool_call(const std::string& text);
 
 // ---------------------------------------------------------------------------

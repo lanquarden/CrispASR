@@ -224,10 +224,12 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
     InferenceArbiter arbiter;
     arbiter.start();
     // One dispatcher per run: the tool decides the task's latency/failure
-    // profile, not the loop. VOICE_TOOL_MODE (or --tool-mode) picks where the
-    // decision comes from; see tool_call.h.
+    // profile, not the loop. --tool-mode (a Config field) wins, then
+    // VOICE_TOOL_MODE, then llm; see tool_call.h.
     ToolDispatcher tools(cfg);
-    const ToolMode tool_mode = tool_mode_from_env();
+    ToolMode tool_mode = ToolMode::Llm;
+    if (cfg.tool_mode.empty() || !parse_tool_mode(cfg.tool_mode, &tool_mode))
+        tool_mode = tool_mode_from_env();
     std::fprintf(stderr, "[tool] mode=%s\n", to_string(tool_mode));
 
     EventQueue events;
@@ -269,10 +271,15 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
     });
 
     auto dispatch_task = [&](const ToolCall& call, const std::string& transcript) {
+        const int64_t dispatch_ms = steady_ms();
+        const ToolProfile profile = tool_profile(call.tool, cfg);
         const uint64_t my_epoch = epoch.load();
         // seq.on_final() stamps task_dispatch_ms speculatively; restamp it with
         // the real start (a corrective dispatch moves it too).
-        seq.metrics().task_dispatch_ms = steady_ms();
+        seq.metrics().task_dispatch_ms = dispatch_ms;
+        // Move the expected result with the dispatch: a corrective redispatch
+        // to set_timer answers in ~0.8 s, not in the configured 6 s.
+        seq.on_task_redispatch(dispatch_ms + profile.latency_ms);
         // Generation guard: a task superseded by a corrective dispatch must not
         // deliver its outcome (a cancelled device check would otherwise be
         // spoken as a task failure). The counter is published before dispatch,
@@ -288,8 +295,23 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
                              : (o.ok ? EventType::TaskResult : EventType::TaskFailed);
                 e.text = o.cancelled ? "cancelled" : o.text;
                 e.t_ms = steady_ms();
+                // The stamp the handler re-checks. The check above and this
+                // post are not atomic: a harness-only fault injector can widen
+                // the window (VOICE_TASK_RESULT_HOLD_MS), which is how the
+                // stale-event path is tested end to end.
+                if (const char* hold = std::getenv("VOICE_TASK_RESULT_HOLD_MS")) {
+                    const long long ms = std::atoll(hold);
+                    if (ms > 0)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+                }
+                e.task_gen = gen;
+                e.task_epoch = my_epoch;
                 events.post(std::move(e));
             });
+        // Every actual adapter dispatch, so a redispatch is visible in the
+        // metrics (tool_calls counts model attempts, not dispatches). Counted
+        // only when the adapter accepted the request.
+        if (id > 0) ++seq.metrics().task_dispatches;
         current_task_id = id;
         if (std::getenv("VOICE_DEBUG"))
             std::fprintf(stderr, "[dbg] dispatch tool=%s id=%d gen=%llu\n",
@@ -847,10 +869,27 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
                     seq.on_barge_in(e.t_ms);
                     break;
                 case EventType::TaskResult:
-                    seq.on_task_result(true, e.text, e.t_ms);
-                    break;
                 case EventType::TaskFailed:
-                    seq.on_task_result(false, e.text, e.t_ms);
+                    // Re-check the stamp: the callback's generation/epoch check
+                    // ran before the post, so an outcome queued before a
+                    // redispatch can still be sitting in the queue after it.
+                    // Speaking it would start the answer from a superseded
+                    // task, and the result we actually kept would then be
+                    // dropped as stale (defect F1 of the M2 review).
+                    if (task_event_is_stale(e, task_generation.load(),
+                                            epoch.load())) {
+                        std::fprintf(stderr,
+                                     "[tool] stale task result dropped "
+                                     "(gen %llu -> %llu, epoch %llu -> %llu)\n",
+                                     (unsigned long long)e.task_gen,
+                                     (unsigned long long)task_generation.load(),
+                                     (unsigned long long)e.task_epoch,
+                                     (unsigned long long)epoch.load());
+                        seq.on_stale_task_result();
+                        break;
+                    }
+                    seq.on_task_result(e.type == EventType::TaskResult, e.text,
+                                       e.t_ms);
                     break;
                 case EventType::PlaybackStarved:
                     seq.on_starved(e.t_ms, e.aux);

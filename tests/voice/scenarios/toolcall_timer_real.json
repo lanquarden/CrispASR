@@ -1,0 +1,13 @@
+{
+  "name": "toolcall_timer_real",
+  "input": "question_timer_real.wav",
+  "transcript": "set a timer for 3 minutes",
+  "runs": 2,
+  "warmup": 1,
+  "tool_mode": "fake_valid",
+  "expect": {
+    "max_gap_ms": 150,
+    "answer_played": true,
+    "max_task_dispatches": 2
+  }
+}

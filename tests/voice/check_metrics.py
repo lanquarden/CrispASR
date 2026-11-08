@@ -27,7 +27,13 @@ Supported expectation keys
   barge_in_stop_ms          : float   p95(speech start -> silence)
   honest_failure_text       : bool    failure was spoken and the task was not
                                       dispatched twice (proxy, see NOTE below)
-  max_task_dispatches       : int     tool_calls per run must not exceed this
+  max_task_dispatches       : int     task_dispatches per run must not exceed
+                                      this (every actual adapter dispatch,
+                                      including a speculative + corrective one)
+  max_stale_results_dropped : int     stale_results_dropped per run <= this
+  min_stale_results_dropped : int     stale_results_dropped per run >= this
+                                      (proves the stale path was taken)
+  max_tool_calls_valid      : int     tool_calls_valid per run <= this
 
 WAV checks — the bookkeeping can lie, the audio cannot
 -----------------------------------------------------
@@ -61,8 +67,8 @@ NOTE on `honest_failure_text`: TurnMetrics has no text field (voice_types.h is a
 contract header and is not edited for this experiment), so "the user heard an
 honest failure" is asserted through what is observable: an answer clause was
 synthesised and played (answer_first_played_ms > 0) and the failing task was
-dispatched at most once (tool_calls <= 1). A spoken transcript is the missing
-signal; this is reported as a contract gap in the harness report.
+dispatched at most once (task_dispatches <= 1). A spoken transcript is the
+missing signal; this is reported as a contract gap in the harness report.
 """
 
 import argparse
@@ -428,13 +434,30 @@ def check_expect(name, expect, summary, records, wav=None):
                     "task dispatched once (TurnMetrics has no text field)")
                 every(lambda r: (run_value(r, "answer_first_played_ms") or 0) > 0,
                       "honest failure spoken (answer_first_played_ms > 0)")
-                every(lambda r: int(r.get("tool_calls", 0) or 0) <= 1,
-                      "no duplicate task dispatch (tool_calls <= 1)")
+                every(lambda r: int(r.get("task_dispatches", 0) or 0) <= 1,
+                      "no duplicate task dispatch (task_dispatches <= 1)")
 
         elif key == "max_task_dispatches":
+            # Adapter dispatches, not model attempts: a corrective redispatch is
+            # a real second dispatch that `tool_calls` (attempts) does not see.
             limit = int(want)
-            every(lambda r, limit=limit: int(r.get("tool_calls", 0) or 0) <= limit,
-                  f"task dispatched at most {limit}x (tool_calls)")
+            every(lambda r, limit=limit: int(r.get("task_dispatches", 0) or 0) <= limit,
+                  f"task dispatched at most {limit}x (task_dispatches)")
+
+        elif key == "max_stale_results_dropped":
+            limit = int(want)
+            every(lambda r, limit=limit: int(r.get("stale_results_dropped", 0) or 0) <= limit,
+                  f"at most {limit} stale result(s) dropped")
+
+        elif key == "min_stale_results_dropped":
+            floor = int(want)
+            every(lambda r, floor=floor: int(r.get("stale_results_dropped", 0) or 0) >= floor,
+                  f"at least {floor} stale result(s) dropped")
+
+        elif key == "max_tool_calls_valid":
+            limit = int(want)
+            every(lambda r, limit=limit: int(r.get("tool_calls_valid", 0) or 0) <= limit,
+                  f"at most {limit} schema-valid tool call(s)")
 
         else:
             problems.append(f"{name}: unknown expectation key '{key}'")
@@ -646,7 +669,8 @@ def _write_case(root, name, expect, runs, ok=True, runs_failed=0,
     measured = [r for r in records if not r["warmup"]]
     metrics = {}
     keys = ["eos_to_first_played_ms", "max_gap_ms", "fillers_played",
-            "answer_first_played_ms", "barge_ins", "barge_in_stop_ms", "tool_calls"]
+            "answer_first_played_ms", "barge_ins", "barge_in_stop_ms", "tool_calls",
+            "tool_calls_valid", "task_dispatches", "stale_results_dropped"]
     for key in keys:
         vals = [float(r.get(key, 0) or 0) for r in measured]
         if not vals:
@@ -668,10 +692,13 @@ def self_test():
     root = tempfile.mkdtemp(prefix="voice-check-selftest-")
     os.makedirs(os.path.join(root, "scenarios"), exist_ok=True)
 
-    def base(eos=300, gap=0, fillers=1, answer=9000, barge=1, stop=120, tools=1):
+    def base(eos=300, gap=0, fillers=1, answer=9000, barge=1, stop=120, tools=1,
+             dispatches=None, valid=1, stale=0):
         return {"eos_to_first_played_ms": eos, "max_gap_ms": gap, "fillers_played": fillers,
                 "answer_first_played_ms": answer, "barge_ins": barge,
-                "barge_in_stop_ms": stop, "tool_calls": tools}
+                "barge_in_stop_ms": stop, "tool_calls": tools,
+                "task_dispatches": tools if dispatches is None else dispatches,
+                "tool_calls_valid": valid, "stale_results_dropped": stale}
 
     # (name, expect, per-run records, summarised ok, expect_problems, kwargs)
     cases = [
@@ -709,6 +736,25 @@ def self_test():
          [dict(base(tools=1)), dict(base(tools=1))], True, False, {}),
         ("fail_duplicate_dispatch", {"max_task_dispatches": 1},
          [dict(base(tools=1)), dict(base(tools=2))], True, True, {}),
+        # A redispatch is invisible in tool_calls (one model attempt, two
+        # dispatches); the gate has to read task_dispatches.
+        ("fail_duplicate_redispatch", {"max_task_dispatches": 1},
+         [dict(base(tools=1, dispatches=1)), dict(base(tools=1, dispatches=2))],
+         True, True, {}),
+        ("pass_redispatch_allowed", {"max_task_dispatches": 2},
+         [dict(base(tools=1, dispatches=2))], True, False, {}),
+        ("pass_stale_expected", {"min_stale_results_dropped": 1},
+         [dict(base(stale=1)), dict(base(stale=2))], True, False, {}),
+        ("fail_stale_missing", {"min_stale_results_dropped": 1},
+         [dict(base(stale=1)), dict(base(stale=0))], True, True, {}),
+        ("pass_no_stale", {"max_stale_results_dropped": 0},
+         [dict(base(stale=0))], True, False, {}),
+        ("fail_stale_dropped", {"max_stale_results_dropped": 0},
+         [dict(base(stale=1))], True, True, {}),
+        ("pass_no_valid_call", {"max_tool_calls_valid": 0},
+         [dict(base(valid=0))], True, False, {}),
+        ("fail_valid_call_unexpected", {"max_tool_calls_valid": 0},
+         [dict(base(valid=1))], True, True, {}),
         ("fail_no_failure_text", {"honest_failure_text": True},
          [dict(base(answer=0))], True, True, {}),
         ("fail_harness_error", {"answer_played": True},

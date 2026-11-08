@@ -17,7 +17,12 @@
 //     "runs": 3,                        // measured runs
 //     "warmup": 1,                      // unmeasured runs, executed first
 //     "barge_in_at_ms": 3000,           // optional
+//     "task_result_hold_ms": 300,       // optional: delay the task completion
+//                                        // after its generation check (F1 test)
 //     "transcript": "...",              // optional final ASR text for fakes
+//     "language": "es",                 // optional en|es (CLI --language wins)
+//     "tool_mode": "fake_valid",        // optional off|llm|fake_valid|fake_invalid
+//                                       // (CLI --tool-mode wins)
 //     "tts_ttfa_ms": 350,               // optional fake-engine timing override
 //     "tts_rate": 4.0,                  // optional
 //     "tts_ttfa_every": 1,              // optional: pay TTFA on every clause
@@ -74,6 +79,8 @@ struct CliExtras {
     bool runs_set = false;
     bool warmup_set = false;
     bool task_ms_set = false;
+    bool language_set = false;
+    bool tool_mode_set = false;
 };
 
 const CliExtras& config_extras();

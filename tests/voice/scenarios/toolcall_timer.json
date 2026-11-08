@@ -8,6 +8,6 @@
   "expect": {
     "max_gap_ms": 150,
     "answer_played": true,
-    "max_task_dispatches": 1
+    "max_task_dispatches": 2
   }
 }

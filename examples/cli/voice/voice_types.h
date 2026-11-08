@@ -74,6 +74,10 @@ struct Config {
     int chat_gpu_layers = 99;
     int chat_ctx = 2048;
 
+    // tool-call experiment. Empty means "use VOICE_TOOL_MODE" (default llm) so
+    // the environment keeps working; a scenario or --tool-mode sets the name.
+    std::string tool_mode;
+
     // experiment
     int runs = 5;                   // warm-up runs excluded
     int warmup_runs = 1;
@@ -113,6 +117,11 @@ struct Event {
     int64_t aux = 0;        // buffer_ms for PlaybackLow/Starved, kind, marker
     int64_t aux2 = 0;       // ttfa / ttft carried by completion markers
     int64_t aux3 = 0;       // kind for completion markers
+    // TaskResult/TaskFailed only: the dispatch generation and the epoch this
+    // outcome was posted under. The handler re-checks both, because an event
+    // queued before a redispatch can be processed after it.
+    uint64_t task_gen = 0;
+    uint64_t task_epoch = 0;
 };
 
 enum class TextKind { Ack, Filler, Answer, Clarify };
@@ -168,6 +177,10 @@ struct TurnMetrics {
     int llm_tokens = 0;
     int tool_calls = 0;
     int tool_calls_valid = 0;
+    // Every actual adapter dispatch, including the speculative one and the
+    // corrective one. tool_calls counts model attempts instead, so a
+    // redispatch shows up here and not there.
+    int task_dispatches = 0;
 
     int tts_pieces = 0;
     int64_t tts_ttfa_ms = 0;

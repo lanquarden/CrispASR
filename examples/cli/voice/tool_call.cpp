@@ -479,14 +479,12 @@ ToolCall parse_tool_call(const std::string& text) {
             call.reason = "no JSON object and no bare tool name";
             return call;
         }
+        // A name without arguments is not a decision: `set_timer` alone cannot
+        // say for how long, and inventing arguments is worse than rejecting the
+        // reply (the orchestrator then falls back to the transcript request).
         call.tool = id;
-        call.valid = true;
-        call.reason = "bare tool name";
-        if (id == ToolId::DeviceStatus) call.device = "garage";
-        if (id == ToolId::SetTimer) {
-            call.minutes = 5;
-            call.reason = "bare tool name, minutes defaulted to 5";
-        }
+        call.valid = false;
+        call.reason = "bare tool name without args";
         return call;
     }
 

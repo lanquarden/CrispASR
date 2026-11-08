@@ -119,6 +119,10 @@ void Config::normalise() {
     if (runs < 1) runs = 1;
     if (warmup_runs < 0) warmup_runs = 0;
     if (filler_bank_size < 0) filler_bank_size = 0;
+
+    // Only the two languages the loop actually supports: an unknown value is
+    // the English path, never a half-translated one.
+    if (language != "es") language = "en";
 }
 
 // ---------------------------------------------------------------------------
@@ -211,6 +215,7 @@ std::string metrics_json(const TurnMetrics& m) {
     append_field(out, "llm_tokens", (int64_t)m.llm_tokens, first);
     append_field(out, "tool_calls", (int64_t)m.tool_calls, first);
     append_field(out, "tool_calls_valid", (int64_t)m.tool_calls_valid, first);
+    append_field(out, "task_dispatches", (int64_t)m.task_dispatches, first);
 
     append_field(out, "tts_pieces", (int64_t)m.tts_pieces, first);
     append_field(out, "tts_ttfa_ms", m.tts_ttfa_ms, first);

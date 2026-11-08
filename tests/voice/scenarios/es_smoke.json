@@ -10,5 +10,6 @@
     "max_gap_ms": 150,
     "min_filler_played": 1,
     "answer_played": true
-  }
+  },
+  "language": "es"
 }

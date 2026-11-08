@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "voice_types.h"
+#include "tool_call.h"
 
 namespace crispasr {
 namespace voice {
@@ -406,6 +407,8 @@ bool apply_config_object(const jsonlite::Object& obj, Config* cfg,
         else if (lk == "tts_voice_dir" || lk == "voice_dir") as_str(&cfg->tts_voice_dir);
         else if (lk == "tts_voice" || lk == "voice") as_str(&cfg->tts_voice);
         else if (lk == "chat_model") as_str(&cfg->chat_model);
+        else if (lk == "language") as_str(&cfg->language);
+        else if (lk == "tool_mode") as_str(&cfg->tool_mode);
         else if (lk == "chat_gpu_layers") as_int(&cfg->chat_gpu_layers);
         else if (lk == "chat_ctx") as_int(&cfg->chat_ctx);
         else if (lk == "runs") as_int(&cfg->runs);
@@ -644,7 +647,29 @@ Config config_from_args(int argc, char** argv) {
         else if (flag == "--vad-min-silence-ms") int_flag(&cfg.vad_min_silence_ms);
         else if (flag == "--vad-min-speech-ms") int_flag(&cfg.vad_min_speech_ms);
         else if (flag == "--clause-max-words") int_flag(&cfg.clause_max_words);
-        else if (flag == "--language") cfg.language = value();
+        else if (flag == "--language") {
+            std::string v = lower(trim(value()));
+            if (v != "en" && v != "es") {
+                std::fprintf(stderr, "warning: --language expects en|es, got '%s'\n",
+                             v.c_str());
+            } else {
+                cfg.language = v;
+                g_extras.language_set = true;
+            }
+        }
+        else if (flag == "--tool-mode") {
+            std::string v = value();
+            ToolMode m = ToolMode::Llm;
+            if (!parse_tool_mode(v, &m)) {
+                std::fprintf(stderr,
+                             "warning: --tool-mode expects off|llm|fake_valid|fake_invalid, "
+                             "got '%s'\n",
+                             v.c_str());
+            } else {
+                cfg.tool_mode = to_string(m);
+                g_extras.tool_mode_set = true;
+            }
+        }
         else if (flag == "--task-ms") {
             int_flag(&cfg.task_ms);
             g_extras.task_ms_set = true;

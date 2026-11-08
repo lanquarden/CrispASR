@@ -41,6 +41,14 @@ struct SequencerStats {
     int barge_ins = 0;
 };
 
+// Whether a TaskResult/TaskFailed event still belongs to the live dispatch.
+// The callback checks generation/epoch before posting, but the check and the
+// post are not atomic: an outcome queued before a redispatch can be processed
+// after it. The handler therefore re-checks against the same counters. Pure,
+// so the selftest can pin both directions without a pipeline.
+bool task_event_is_stale(const Event& e, uint64_t current_gen,
+                         uint64_t current_epoch);
+
 class SpeechSequencer {
    public:
     SpeechSequencer(const Config& cfg, int sample_rate);
@@ -50,6 +58,15 @@ class SpeechSequencer {
     void on_partial(const std::string& text, int64_t t_ms);
     void on_final(const std::string& text, int64_t t_ms);
     void on_task_result(bool ok, const std::string& text, int64_t t_ms);
+    // A corrective dispatch (the model chose a different tool than the
+    // speculative one) moves the expected result. The filler reserve is
+    // anchored to `task_deadline_ms_`, and the near-result window (shortest
+    // bank phrase) is derived from it, so re-anchoring here is what keeps the
+    // bridge honest after a redispatch.
+    void on_task_redispatch(int64_t deadline_ms);
+    // A completion that no longer belongs to the live dispatch (superseded by a
+    // redispatch, or flushed by a barge-in) is counted, never spoken.
+    void on_stale_task_result();
     void on_text_delta(TextKind kind, const std::string& piece, int64_t t_ms);
     void on_text_done(TextKind kind, int64_t t_ms);
     void on_playback(int64_t buffer_ms, int64_t played_ms, int64_t t_ms);
@@ -65,6 +82,12 @@ class SpeechSequencer {
     const TurnMetrics& metrics() const { return metrics_; }
     const std::string& transcript() const { return transcript_; }
     const std::string& spoken_filler_context() const { return spoken_context_; }
+
+    // Diagnostics (not part of the metrics contract): the committed-speech
+    // estimate and the expected result. The selftest reads them to pin the
+    // redispatch deadline (F3) and the estimate released by a drop (F5).
+    int64_t committed_speech_ms() const { return speech_committed_ms_; }
+    int64_t task_deadline_ms() const { return task_deadline_ms_; }
 
     // Diagnostics for the filler policy itself (not part of the metrics
     // contract): the sweep reads them to explain a thin bridge.
@@ -87,6 +110,10 @@ class SpeechSequencer {
     void flush_text();
     void maybe_request_filler(const std::string& reason, int64_t t_ms);
     void request_next_clause(int64_t t_ms);
+    // Speech that was counted as committed but will never be played: the
+    // estimate has to come back out, or remaining_speech_ms() keeps believing
+    // the bridge is covered and stops requesting filler.
+    void drop_committed(const TextSegment& s);
     std::string next_bank_filler(bool shortest_first);
     bool queue_bank_filler(int64_t t_ms);
     bool accept_filler_text(const std::string& text);

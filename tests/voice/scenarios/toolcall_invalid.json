@@ -11,6 +11,7 @@
     "max_gap_ms": 150,
     "min_filler_played": 1,
     "answer_played": true,
-    "max_task_dispatches": 1
+    "max_task_dispatches": 1,
+    "max_tool_calls_valid": 0
   }
 }

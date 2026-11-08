@@ -149,8 +149,8 @@ int selftest_impl() {
     }
     {
         const ToolCall c = parse_tool_call("set_timer");
-        check(c.valid && c.tool == ToolId::SetTimer && c.minutes == 5,
-              "tool: bare tool name accepted (minutes defaulted)");
+        check(!c.valid && c.tool == ToolId::SetTimer,
+              "tool: bare tool name rejected (no args, nothing invented)");
     }
     {
         const ToolCall c =
@@ -209,6 +209,76 @@ int selftest_impl() {
               "tool: latency profiles 6 s / <=1 s / 0");
     }
 
+    // 8. a task completion is only current for the dispatch that posted it.
+    {
+        Event e;
+        e.type = EventType::TaskResult;
+        e.task_gen = 1;
+        e.task_epoch = 7;
+        check(!task_event_is_stale(e, 1, 7), "task event: current dispatch accepted");
+        check(task_event_is_stale(e, 2, 7),
+              "task event: completion from a superseded dispatch is stale");
+        check(task_event_is_stale(e, 1, 8),
+              "task event: completion from a flushed epoch is stale");
+        Event legacy;  // no stamp at all
+        legacy.type = EventType::TaskResult;
+        check(task_event_is_stale(legacy, 1, 7),
+              "task event: unstamped completion is stale");
+    }
+
+    // 9. a stale completion is counted, never spoken, and asks for nothing.
+    {
+        SpeechSequencer s(cfg, cfg.sample_rate);
+        s.on_speech_start(0);
+        s.on_final("check the garage", 1000);
+        s.take_actions();
+        s.on_stale_task_result();
+        check(s.metrics().stale_results_dropped == 1,
+              "stale completion is counted");
+        auto a = s.take_actions();
+        check(a.empty(), "stale completion speaks nothing");
+    }
+
+    // 10. a redispatch re-anchors the expected result (F3).
+    {
+        SpeechSequencer s(cfg, cfg.sample_rate);
+        s.on_speech_start(0);
+        s.on_final("check the garage", 1000);
+        s.take_actions();
+        const int64_t spec_deadline = s.task_deadline_ms();
+        s.on_task_redispatch(1000 + 900);  // set_timer answers in ~0.9 s
+        check(spec_deadline == 1000 + cfg.task_ms && s.task_deadline_ms() == 1900,
+              "redispatch moves the task deadline");
+    }
+
+    // 11. clauses that will never be spoken release their committed speech (F5),
+    //     and a filler that arrives after the result is not bridged again (F4).
+    {
+        Config deep = cfg;
+        deep.low_water_ms = 10;
+        deep.target_water_ms = 50;
+        deep.high_water_ms = 100;
+        SpeechSequencer s(deep, deep.sample_rate);
+        s.on_speech_start(0);
+        s.on_final("check the garage", 1000);
+        s.take_actions();
+        s.metrics().ack_first_played_ms = 1100;
+        s.on_playback(500, 0, 1200);  // ring above high water: clauses queue up
+        s.on_text_delta(TextKind::Filler, "One moment.", 1300);
+        s.on_text_done(TextKind::Filler, 1400);
+        const int64_t committed = s.committed_speech_ms();
+        s.on_task_result(true, "the garage is closed", 1500);
+        check(committed > 0 && s.committed_speech_ms() == 0,
+              "dropped clauses release their committed speech");
+        s.take_actions();
+        s.on_text_delta(TextKind::Filler, "Just a moment.", 1600);
+        s.on_text_done(TextKind::Filler, 1650);
+        bool bridged = false;
+        for (auto& x : s.take_actions())
+            if (x.kind == TextKind::Filler) bridged = true;
+        check(!bridged, "filler finishing after the result does not queue a bank phrase");
+    }
+
     std::printf("%d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
 }
@@ -216,54 +286,13 @@ int selftest_impl() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    // --tool-mode belongs to the tool-call experiment, and config.cpp is not
-    // this milestone's file: consume it here, put it in the environment (where
-    // tool_call.cpp reads it), and drop it from the argv config.cpp sees.
-    std::vector<std::string> owned;
-    owned.reserve((size_t)(argc > 0 ? argc : 0));
-    if (argc > 0) owned.push_back(argv[0] ? argv[0] : "crispasr-voice");
-    for (int i = 1; i < argc; ++i) {
-        std::string arg = argv[i] ? argv[i] : "";
-        std::string value;
-        bool is_tool_mode = false;
-        if (arg == "--tool-mode") {
-            is_tool_mode = true;
-            if (i + 1 < argc) {
-                ++i;
-                value = argv[i] ? argv[i] : "";
-            }
-        } else if (arg.rfind("--tool-mode=", 0) == 0) {
-            is_tool_mode = true;
-            value = arg.substr(std::strlen("--tool-mode="));
-        }
-        if (!is_tool_mode) {
-            owned.push_back(arg);
-            continue;
-        }
-        ToolMode m = ToolMode::Llm;
-        if (!parse_tool_mode(value, &m)) {
-            std::fprintf(stderr,
-                         "warning: --tool-mode expects off|llm|fake_valid|fake_invalid, "
-                         "got '%s'\n",
-                         value.c_str());
-            continue;
-        }
-#if defined(_WIN32)
-        _putenv_s("VOICE_TOOL_MODE", to_string(m));
-#else
-        ::setenv("VOICE_TOOL_MODE", to_string(m), 1);
-#endif
-    }
-    std::vector<char*> av;
-    av.reserve(owned.size());
-    for (std::string& s : owned) av.push_back(const_cast<char*>(s.c_str()));
-    char** argv_owned = av.empty() ? argv : av.data();
-    const int argc_owned = av.empty() ? argc : (int)av.size();
+    // --tool-mode is a normal config flag now (config.cpp), so a scenario can
+    // carry its own and the CLI still wins. Nothing to rewrite here.
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i] ? argv[i] : "", "--selftest") == 0)
+            return selftest_impl();
 
-    for (int i = 1; i < argc_owned; ++i)
-        if (std::strcmp(argv_owned[i], "--selftest") == 0) return selftest_impl();
-
-    Config cfg = config_from_args(argc_owned, argv_owned);
+    Config cfg = config_from_args(argc, argv);
 
     const CliExtras& x = config_extras();
     if (cfg.mode == "selftest")

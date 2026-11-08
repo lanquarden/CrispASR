@@ -37,6 +37,7 @@
 #include <sys/types.h>
 
 #include "engines.h"
+#include "tool_call.h"
 #include "voice_loop.h"
 #include "voice_types.h"
 
@@ -178,8 +179,10 @@ struct Scenario {
     int warmup = 1;
     int task_ms = -1;
     std::string language;
+    std::string tool_mode;
     int task_fail_percent = -1;
     int barge_in_at_ms = -1;
+    int task_result_hold_ms = -1;
     bool has_transcript = false;
     std::string transcript;
     std::string tts_ttfa_ms;  // raw strings: they go straight to the environment
@@ -231,10 +234,13 @@ bool load_scenario(const std::string& path, Scenario* sc, std::string* err) {
         else if (key == "warmup" || key == "warmup_runs") sc->warmup = to_int(val, sc->warmup);
         else if (key == "task_ms") sc->task_ms = to_int(val, sc->task_ms);
         else if (key == "language") sc->language = val;
+        else if (key == "tool_mode") sc->tool_mode = val;
         else if (key == "task_fail_percent") {
             sc->task_fail_percent = to_int(val, sc->task_fail_percent);
         } else if (key == "barge_in_at_ms") {
             sc->barge_in_at_ms = to_int(val, sc->barge_in_at_ms);
+        } else if (key == "task_result_hold_ms") {
+            sc->task_result_hold_ms = to_int(val, sc->task_result_hold_ms);
         } else if (key == "transcript") {
             sc->has_transcript = true;
             sc->transcript = val;
@@ -326,6 +332,7 @@ const std::vector<std::pair<std::string, FieldFn>>& metric_fields() {
         {"llm_tokens", [](const TurnMetrics& m) { return (double)m.llm_tokens; }},
         {"tool_calls", [](const TurnMetrics& m) { return (double)m.tool_calls; }},
         {"tool_calls_valid", [](const TurnMetrics& m) { return (double)m.tool_calls_valid; }},
+        {"task_dispatches", [](const TurnMetrics& m) { return (double)m.task_dispatches; }},
         {"tts_pieces", [](const TurnMetrics& m) { return (double)m.tts_pieces; }},
         {"tts_ttfa_ms", [](const TurnMetrics& m) { return (double)m.tts_ttfa_ms; }},
         {"tts_block_max_ms", [](const TurnMetrics& m) { return (double)m.tts_block_max_ms; }},
@@ -457,7 +464,30 @@ int run_harness(const Config& cfg_in, const std::string& scenario_path) {
     if (!extras.runs_set) cfg.runs = sc.runs;
     if (!extras.warmup_set) cfg.warmup_runs = sc.warmup;
     if (!extras.task_ms_set && sc.task_ms >= 0) cfg.task_ms = sc.task_ms;
-    if (!sc.language.empty()) cfg.language = sc.language;
+    // Like task_ms: the scenario is a default, an explicit flag wins.
+    if (!sc.language.empty()) {
+        const std::string lang = sc.language;
+        if (lang != "en" && lang != "es") {
+            std::fprintf(stderr, "harness: %s: ignoring language '%s' (expects en|es)\n",
+                         scenario_path.c_str(), lang.c_str());
+        } else if (!extras.language_set) {
+            cfg.language = lang;
+        }
+    }
+    if (!sc.tool_mode.empty() && !extras.tool_mode_set) {
+        ToolMode m = ToolMode::Llm;
+        if (!parse_tool_mode(sc.tool_mode, &m)) {
+            std::fprintf(stderr,
+                         "harness: %s: ignoring tool_mode '%s' "
+                         "(expects off|llm|fake_valid|fake_invalid)\n",
+                         scenario_path.c_str(), sc.tool_mode.c_str());
+        } else {
+            // Where the decision comes from, per scenario: the old scenarios
+            // were all run through VOICE_TOOL_MODE by hand, which is exactly the
+            // coupling this key removes.
+            cfg.tool_mode = to_string(m);
+        }
+    }
     if (sc.task_fail_percent >= 0) cfg.task_fail_percent = sc.task_fail_percent;
     if (cfg.runs <= 0) cfg.runs = 1;
     if (cfg.warmup_runs < 0) cfg.warmup_runs = 0;
@@ -471,6 +501,8 @@ int run_harness(const Config& cfg_in, const std::string& scenario_path) {
     std::printf("harness: input '%s', task_ms=%d, fail=%d%%, runs=%d+%d warmup, out '%s'\n",
                 sc.input_wav.c_str(), cfg.task_ms, cfg.task_fail_percent, cfg.runs,
                 cfg.warmup_runs, scen_dir.c_str());
+    std::printf("harness: language=%s, tool_mode=%s\n", cfg.language.c_str(),
+                cfg.tool_mode.empty() ? "(env)" : cfg.tool_mode.c_str());
 
     // Fake-engine timings and the barge-in marker travel through the
     // environment; see the header comment of engines_fake.cpp.
@@ -478,6 +510,12 @@ int run_harness(const Config& cfg_in, const std::string& scenario_path) {
     env.emplace_back(new EnvGuard("VOICE_BARGE_IN_AT_MS",
                                   sc.barge_in_at_ms >= 0 ? std::to_string(sc.barge_in_at_ms)
                                                          : std::string()));
+    if (sc.task_result_hold_ms >= 0) {
+        // Fault injector for the F1 window: hold the completion after its
+        // generation check so it lands after the redispatch. Harness only.
+        env.emplace_back(new EnvGuard("VOICE_TASK_RESULT_HOLD_MS",
+                                      std::to_string(sc.task_result_hold_ms)));
+    }
     if (sc.has_transcript) {
         env.emplace_back(new EnvGuard("VOICE_FAKE_TRANSCRIPT", sc.transcript));
     }

@@ -28,6 +28,32 @@ const char* const kFillerBank[] = {
 };
 constexpr int kFillerCount = (int)(sizeof(kFillerBank) / sizeof(kFillerBank[0]));
 
+// The bank is lip-synced to the TTS voice, so it is not translated at runtime:
+// an English phrase read by the Spanish voice is exactly the accent failure the
+// language flag exists to avoid. Same shape as the English bank (short, no
+// digits, no result claims, one clause each).
+const char* const kFillerBankEs[] = {
+    "Un momento.",
+    "Déjame comprobar.",
+    "Estoy mirando.",
+    "Un segundo.",
+    "Dame un momento.",
+    "Lo estoy revisando.",
+    "Espera un segundo.",
+    "Ahora mismo lo miro.",
+};
+constexpr int kFillerCountEs =
+    (int)(sizeof(kFillerBankEs) / sizeof(kFillerBankEs[0]));
+
+const char* bank_phrase(const std::string& language, int idx) {
+    if (language == "es") return kFillerBankEs[idx % kFillerCountEs];
+    return kFillerBank[idx % kFillerCount];
+}
+
+int bank_count(const std::string& language) {
+    return language == "es" ? kFillerCountEs : kFillerCount;
+}
+
 bool is_sentence_end(char c) {
     return c == '.' || c == '!' || c == '?' || c == ';' || c == ':';
 }
@@ -188,12 +214,19 @@ constexpr int64_t kResultReserveMs = 500;
 constexpr int kMaxLlmFillerAttempts = 3;
 constexpr size_t kMaxSpokenFillersRemembered = 64;
 // Spoken-duration estimate, measured on the real engines (~325 ms/word for the
-// qwen3-tts clone voice). Used as the filler budget: committed speech minus
-// playback elapsed.
+// English qwen3-tts clone voice, ~360 ms/word for Spanish; the longer figure is
+// the conservative one, because over-estimating only shortens the bridge while
+// under-estimating leaves dead air). Used as the filler budget: committed
+// speech minus playback elapsed.
 constexpr int64_t kMsPerWord = 325;
+constexpr int64_t kMsPerWordEs = 360;
 
-int64_t estimate_speech_ms(const std::string& s) {
-    return (int64_t)word_count(s) * kMsPerWord;
+int64_t ms_per_word(const Config& cfg) {
+    return cfg.language == "es" ? kMsPerWordEs : kMsPerWord;
+}
+
+int64_t estimate_speech_ms(const std::string& s, const Config& cfg) {
+    return (int64_t)word_count(s) * ms_per_word(cfg);
 }
 
 }  // namespace
@@ -202,6 +235,11 @@ SpeechSequencer::SpeechSequencer(const Config& cfg, int sample_rate)
     : cfg_(cfg), rate_(sample_rate) {}
 
 void SpeechSequencer::emit(Action a) { actions_.push_back(std::move(a)); }
+
+bool task_event_is_stale(const Event& e, uint64_t current_gen,
+                         uint64_t current_epoch) {
+    return e.task_gen != current_gen || e.task_epoch != current_epoch;
+}
 
 std::vector<Action> SpeechSequencer::take_actions() {
     auto out = std::move(actions_);
@@ -292,10 +330,12 @@ void SpeechSequencer::on_final(const std::string& text, int64_t t_ms) {
     task_deadline_ms_ = t_ms + cfg_.task_ms;
     // The orchestrator dispatches the task when it sees this request; the ack
     // is generated immediately and in parallel.
+    // Do NOT ask for a restatement: both 0.6B and 1.7B then answer the
+    // question instead of acknowledging it (bench: 10-20% result claims).
     emit_request(TextKind::Ack,
                  "The user said: \"" + transcript_ + "\". Reply with one short "
-                 "acknowledgement that restates what you understood and says you "
-                 "are checking. No result, no speculation.");
+                 "acknowledgement that says you are checking. Do not restate the "
+                 "request, do not state any status or result, do not ask a question.");
 }
 
 void SpeechSequencer::on_task_result(bool ok, const std::string& text,
@@ -313,6 +353,7 @@ void SpeechSequencer::on_task_result(bool ok, const std::string& text,
         for (auto& s : clauses_) {
             if (s.kind == TextKind::Ack || s.kind == TextKind::Filler) {
                 ++stats_.fillers_dropped_stale;  // counted as stale speech
+                drop_committed(s);
             } else {
                 kept.push_back(std::move(s));
             }
@@ -331,6 +372,24 @@ void SpeechSequencer::on_task_result(bool ok, const std::string& text,
                      "Background result: \"" + task_text_ +
                      "\". Answer in one or two short spoken sentences, continuing "
                      "naturally from what you already said.");
+}
+
+void SpeechSequencer::on_stale_task_result() {
+    ++stats_.stale_results_dropped;
+    metrics_.stale_results_dropped = stats_.stale_results_dropped;
+}
+
+void SpeechSequencer::on_task_redispatch(int64_t deadline_ms) {
+    if (!turn_active()) return;
+    // Re-anchoring the deadline also moves the near-result window: the bank
+    // picks its shortest phrase from `task_deadline_ms_ - t_ms`, so nothing
+    // else has to be reset here.
+    task_deadline_ms_ = std::max<int64_t>(0, deadline_ms);
+}
+
+void SpeechSequencer::drop_committed(const TextSegment& s) {
+    speech_committed_ms_ =
+        std::max<int64_t>(0, speech_committed_ms_ - estimate_speech_ms(s.text, cfg_));
 }
 
 void SpeechSequencer::on_text_delta(TextKind kind, const std::string& piece,
@@ -353,6 +412,7 @@ void SpeechSequencer::on_text_delta(TextKind kind, const std::string& piece,
 void SpeechSequencer::on_text_done(TextKind kind, int64_t t_ms) {
     generation_active_[(int)kind] = false;
     if (kind == TextKind::Answer) answer_requested_ = false;
+    const int stale_before = stats_.fillers_dropped_stale;
     feed_text(kind, std::string(), t_ms, true);
     if (kind != TextKind::Filler) return;
 
@@ -360,10 +420,19 @@ void SpeechSequencer::on_text_done(TextKind kind, int64_t t_ms) {
     // counter stuck, or the bridge stops asking for filler for the rest of the
     // turn.
     if (llm_fillers_outstanding_ > 0) --llm_fillers_outstanding_;
+
+    // The result (or the answer's own audio) arrived while this filler was
+    // still being generated. Its clauses were dropped as stale above; queuing a
+    // fresh bank phrase now would put speech in front of the answer, which is
+    // the delay this guard exists to prevent.
+    if (task_done_ || answer_buffered_) return;
     if (llm_filler_speakable_ > 0) {
         llm_filler_empty_streak_ = 0;
         return;
     }
+    // Clauses existed but were dropped as stale: that is not an empty
+    // generation, so it must not count toward the retry limit.
+    if (stats_.fillers_dropped_stale > stale_before) return;
 
     // Empty, unspoken, or a rejected repeat: the bridge must not stall. The bank
     // is the safety net in every mode (that is what a pre-written bank is for);
@@ -397,7 +466,7 @@ void SpeechSequencer::feed_text(TextKind kind, const std::string& piece,
                 break;
             }
             ack_words_ += word_count(clause);
-            speech_committed_ms_ += estimate_speech_ms(clause);
+            speech_committed_ms_ += estimate_speech_ms(clause, cfg_);
         }
         if (kind == TextKind::Filler) {
             // A filler that arrives after the result is in is stale speech: the
@@ -417,7 +486,7 @@ void SpeechSequencer::feed_text(TextKind kind, const std::string& piece,
         if (kind == TextKind::Filler) {
             s.expire_ms = t_ms + 4000;
             ++stats_.fillers_queued;
-            speech_committed_ms_ += estimate_speech_ms(clause);
+            speech_committed_ms_ += estimate_speech_ms(clause, cfg_);
         }
         clauses_.push_back(std::move(s));
     }
@@ -438,7 +507,7 @@ void SpeechSequencer::feed_text(TextKind kind, const std::string& piece,
                 s.expire_ms = t_ms + 4000;
                 ++llm_filler_speakable_;
                 ++stats_.fillers_queued;
-                speech_committed_ms_ += estimate_speech_ms(rest);
+                speech_committed_ms_ += estimate_speech_ms(rest, cfg_);
             }
             clauses_.push_back(std::move(s));
         } else if (kind == TextKind::Filler && task_done_) {
@@ -455,10 +524,12 @@ void SpeechSequencer::request_next_clause(int64_t t_ms) {
         TextSegment& s = clauses_.front();
         if (text_stale(s, t_ms)) {
             if (s.kind == TextKind::Filler) ++stats_.fillers_dropped_stale;
+            drop_committed(s);
             clauses_.pop_front();
             continue;
         }
         if (answer_buffered_ && s.kind == TextKind::Filler) {
+            drop_committed(s);
             clauses_.pop_front();
             ++stats_.fillers_dropped_stale;
             continue;
@@ -549,7 +620,7 @@ bool SpeechSequencer::queue_bank_filler(int64_t t_ms) {
             s.created_ms = t_ms;
             s.expire_ms = t_ms + 4000;
             ++stats_.fillers_queued;
-            speech_committed_ms_ += estimate_speech_ms(s.text);
+            speech_committed_ms_ += estimate_speech_ms(s.text, cfg_);
             clauses_.push_back(std::move(s));
             request_next_clause(t_ms);
             return true;
@@ -605,10 +676,11 @@ std::string SpeechSequencer::recent_fillers_for_prompt() const {
 std::string SpeechSequencer::next_bank_filler(bool shortest_first) {
     // Never repeat a bank phrase: walk the ring buffer and skip anything this
     // session already used. Returns "" when the bank is exhausted.
+    const int count = bank_count(cfg_.language);
     int best = -1;
-    for (int i = 0; i < kFillerCount; ++i) {
-        const int idx = (bank_cursor_ + i) % kFillerCount;
-        const std::string cand = kFillerBank[idx];
+    for (int i = 0; i < count; ++i) {
+        const int idx = (bank_cursor_ + i) % count;
+        const std::string cand = bank_phrase(cfg_.language, idx);
         if (std::find(spoken_bank_.begin(), spoken_bank_.end(), cand) !=
             spoken_bank_.end())
             continue;
@@ -616,12 +688,14 @@ std::string SpeechSequencer::next_bank_filler(bool shortest_first) {
             best = idx;
             break;
         }
-        if (best < 0 || word_count(cand) < word_count(kFillerBank[best])) best = idx;
+        if (best < 0 ||
+            word_count(cand) < word_count(bank_phrase(cfg_.language, best)))
+            best = idx;
     }
     if (best < 0) return std::string();
-    bank_cursor_ = (best + 1) % kFillerCount;
-    spoken_bank_.push_back(kFillerBank[best]);
-    return kFillerBank[best];
+    bank_cursor_ = (best + 1) % count;
+    spoken_bank_.push_back(bank_phrase(cfg_.language, best));
+    return bank_phrase(cfg_.language, best);
 }
 
 void SpeechSequencer::on_playback(int64_t buffer_ms, int64_t played_ms,
@@ -647,6 +721,7 @@ void SpeechSequencer::on_playback(int64_t buffer_ms, int64_t played_ms,
         for (auto& s : clauses_) {
             if (s.kind == TextKind::Filler) {
                 ++stats_.fillers_dropped_stale;
+                drop_committed(s);
             } else {
                 kept.push_back(std::move(s));
             }
