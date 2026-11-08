@@ -5,6 +5,9 @@
 // the three models never run concurrently on the shared Vulkan device.
 #include "voice_loop.h"
 
+#include <sys/stat.h>
+#include <sys/types.h>
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -121,6 +124,50 @@ std::map<std::string, std::vector<float>> prerender_fillers(TtsEngine* tts,
 constexpr int64_t kLlmDone = 100;  // + kind
 constexpr int64_t kTtsDone = 200;
 
+// Timeline.csv cadence for the playback ring rows.
+constexpr int64_t kPlaybackTraceMs = 100;
+
+// A queued LLM request, with the turn context needed to write its timeline row
+// relative to the same base as metrics.jsonl.
+struct PendingText {
+    TextKind kind = TextKind::Ack;
+    std::string prompt;
+    int64_t request_ms = 0;  // absolute steady_ms when the action ran
+    int turn = 0;
+    int64_t base_ms = 0;     // absolute speech_start of that turn
+};
+
+// A queued TTS piece: same idea. TextSegment alone cannot carry the base.
+struct PendingSpeak {
+    TextSegment segment;
+    int64_t request_ms = 0;
+    int turn = 0;
+    int64_t base_ms = 0;
+};
+
+// `--out` is the output WAV in single-run mode and a directory in harness mode.
+// The timeline file lives beside whichever one was given.
+std::string timeline_path_for(const std::string& out) {
+    struct stat st;
+    if (!out.empty() && ::stat(out.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+        return out + "/timeline.csv";
+    const size_t slash = out.find_last_of('/');
+    if (slash == std::string::npos) return std::string("timeline.csv");
+    if (slash == 0) return std::string("/timeline.csv");
+    return out.substr(0, slash) + "/timeline.csv";
+}
+
+void write_timeline(const std::string& path) {
+    std::ofstream tf(path, std::ios::trunc);
+    if (!tf) {
+        std::fprintf(stderr, "voice: cannot write timeline '%s'\n", path.c_str());
+        return;
+    }
+    tf << timeline_csv_header();
+    for (const TimelineRow& row : timeline_trace().rows())
+        tf << timeline_csv_row(row);
+}
+
 }  // namespace
 
 LoopRun run_once(const Config& cfg_in, Engines& engines,
@@ -140,6 +187,10 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
 
     const int rate = cfg.sample_rate;
     const int frame = cfg.frame_samples;
+
+    // The timeline trace is process-wide (the harness stamps the run number and
+    // copies the rows after each run); one call to run_once is one run's worth.
+    timeline_trace().clear_rows();
 
     WavReader reader;
     std::string err;
@@ -215,11 +266,11 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
 
     // ---- LLM: one generation at a time, FIFO --------------------------------
     std::mutex llm_mu;
-    std::deque<std::pair<TextKind, std::string>> llm_pending;
+    std::deque<PendingText> llm_pending;
     std::atomic<bool> llm_busy{false};
 
     std::function<void()> pump_llm = [&] {
-        std::pair<TextKind, std::string> item;
+        PendingText item;
         {
             std::lock_guard<std::mutex> lk(llm_mu);
             if (llm_busy.load() || llm_pending.empty()) return;
@@ -227,11 +278,11 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
             item = llm_pending.front();
             llm_pending.pop_front();
         }
-        const TextKind kind = item.first;
-        const std::string prompt = item.second;
+        const TextKind kind = item.kind;
+        const std::string prompt = item.prompt;
         const uint64_t my_epoch = epoch.load();
         work_in_flight.fetch_add(1);
-        arbiter.post(Priority::Llm, "llm", [&, kind, prompt, my_epoch] {
+        arbiter.post(Priority::Llm, "llm", [&, item, kind, prompt, my_epoch] {
             WorkGuard wg(work_in_flight);
             std::vector<ChatMessage> msgs;
             ChatMessage sys;
@@ -261,9 +312,13 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
 
             const int64_t started = steady_ms();
             int64_t first_token = 0;
+            int tokens = 0;
+            std::string generated;
             TokenCallback on_token = [&](const std::string& piece) {
                 if (my_epoch != epoch.load()) return false;
                 if (first_token == 0) first_token = steady_ms();
+                ++tokens;
+                generated += piece;
                 Event e;
                 e.type = EventType::Tick;
                 e.text = piece;
@@ -276,9 +331,31 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
                                        ? cfg.answer_max_clause_tokens
                                        : 64;
             engines.llm->generate(msgs, max_tokens, on_token, std::string());
+            const int64_t finished = steady_ms();
             {
                 std::lock_guard<std::mutex> lk(llm_mu);
                 llm_busy = false;
+            }
+            // The row is written even for an aborted generation: "text was
+            // requested, produced this much, then the turn was flushed" is
+            // exactly the event a barge-in timeline has to show.
+            {
+                const int64_t base = item.base_ms;
+                TimelineRow row;
+                row.turn = item.turn;
+                row.stage = "llm";
+                row.kind = to_string(kind);
+                row.text = generated;
+                row.t_request_ms = base > 0 ? item.request_ms - base : -1;
+                row.t_job_start_ms = base > 0 ? started - base : -1;
+                // No PCM here: the first output of an LLM job is its first
+                // token, so that is what the column carries.
+                row.t_first_pcm_ms = (first_token > 0 && base > 0) ? first_token - base : -1;
+                row.t_first_audible_ms = -1;
+                row.t_done_ms = base > 0 ? finished - base : -1;
+                row.samples = tokens;
+                row.audible_ms = 0;
+                timeline_trace().add(std::move(row));
             }
             if (my_epoch != epoch.load()) return;  // aborted: no stale done event
             Event done;
@@ -293,22 +370,22 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
 
     // ---- TTS: one piece at a time, FIFO (ordering is audible) ---------------
     std::mutex tts_mu;
-    std::deque<TextSegment> tts_pending;
+    std::deque<PendingSpeak> tts_pending;
     std::atomic<bool> tts_busy{false};
 
     std::function<void()> pump_tts = [&] {
-        TextSegment seg;
+        PendingSpeak item;
         {
             std::lock_guard<std::mutex> lk(tts_mu);
             if (tts_busy.load() || tts_pending.empty()) return;
             // Backpressure: synthesising 4x faster than playback must not
             // outrun the ring. The answer is exempt: it must be buffered the
             // moment it exists, or it waits for the watermark to drain.
-            if (tts_pending.front().kind != TextKind::Answer &&
+            if (tts_pending.front().segment.kind != TextKind::Answer &&
                 ring.buffer_ms(rate) >= cfg.high_water_ms)
                 return;
             tts_busy = true;
-            seg = tts_pending.front();
+            item = tts_pending.front();
             tts_pending.pop_front();
         }
         const uint64_t my_epoch = epoch.load();
@@ -316,19 +393,53 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
                                 ? Priority::TtsUrgent
                                 : Priority::TtsIdle;
         work_in_flight.fetch_add(1);
-        arbiter.post(pr, "tts", [&, seg, my_epoch] {
+        arbiter.post(pr, "tts", [&, item, my_epoch] {
             WorkGuard wg(work_in_flight);
+            const TextSegment& seg = item.segment;
+            const int64_t base = item.base_ms;
             const int64_t job_started = steady_ms();
             int64_t first_pcm = 0;
+            int64_t samples = 0;
+            AudibilityMeter meter(rate);
             engines.tts->synthesize(seg.text, [&](const float* p, int n, bool) {
                 if (my_epoch != epoch.load()) return;
-                if (first_pcm == 0) first_pcm = steady_ms();
+                const int64_t t = steady_ms();
+                if (first_pcm == 0) first_pcm = t;
+                meter.push(p, n);
+                samples += n;
                 ring.push(p, n);
                 ledger.add(seg.kind, n);
             });
+            meter.finish();
+            const int64_t job_done = steady_ms();
             {
                 std::lock_guard<std::mutex> lk(tts_mu);
                 tts_busy = false;
+            }
+            // Per-piece row: the whole point of the trace. A piece that emits
+            // 400 ms of model silence before speech shows up as
+            // t_first_audible_ms much later than t_first_pcm_ms; a piece that
+            // simply arrives late shows up as a large t_job_start_ms.
+            {
+                TimelineRow row;
+                row.turn = item.turn;
+                row.stage = "tts";
+                row.kind = to_string(seg.kind);
+                row.text = seg.text;
+                row.t_request_ms = base > 0 ? item.request_ms - base : -1;
+                row.t_job_start_ms = base > 0 ? job_started - base : -1;
+                row.t_first_pcm_ms = (first_pcm > 0 && base > 0) ? first_pcm - base : -1;
+                // Emission time of the first chunk, plus the offset of the
+                // first loud 10 ms window inside the piece: the emitted stream
+                // gains that silence before it becomes audible.
+                row.t_first_audible_ms =
+                    (first_pcm > 0 && base > 0 && meter.found())
+                        ? (first_pcm - base) + meter.first_window() * meter.window_ms()
+                        : -1;
+                row.t_done_ms = base > 0 ? job_done - base : -1;
+                row.samples = samples;
+                row.audible_ms = meter.audible_ms();
+                timeline_trace().add(std::move(row));
             }
             if (my_epoch != epoch.load()) return;  // aborted: no stale done event
             Event done;
@@ -345,9 +456,15 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
         for (Action& a : actions) {
             switch (a.type) {
                 case ActionType::RequestText: {
+                    PendingText item;
+                    item.kind = a.kind;
+                    item.prompt = a.text;
+                    item.request_ms = steady_ms();
+                    item.turn = seq.turn_id();
+                    item.base_ms = seq.metrics().speech_start_ms;
                     {
                         std::lock_guard<std::mutex> lk(llm_mu);
-                        llm_pending.emplace_back(a.kind, a.text);
+                        llm_pending.push_back(std::move(item));
                     }
                     pump_llm();
                     break;
@@ -362,9 +479,14 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
                         ring.push(it->second.data(), (int)it->second.size());
                         ledger.add(a.segment.kind, (int64_t)it->second.size());
                     } else {
+                        PendingSpeak item;
+                        item.segment = a.segment;
+                        item.request_ms = steady_ms();
+                        item.turn = seq.turn_id();
+                        item.base_ms = seq.metrics().speech_start_ms;
                         {
                             std::lock_guard<std::mutex> lk(tts_mu);
-                            tts_pending.push_back(a.segment);
+                            tts_pending.push_back(std::move(item));
                         }
                         pump_tts();
                     }
@@ -429,6 +551,7 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
     PacedSource source(&reader, rate, frame);
     std::vector<float> frame_buf((size_t)frame);
     int64_t last_partial_ms = 0, last_tick_ms = 0, last_event_ms = steady_ms();
+    int64_t last_playback_trace_ms = 0;
     bool speech_final_posted = false;
     bool at_eof = false;
     bool barge_done = false;
@@ -667,6 +790,23 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
             pump_tts();  // deferred pieces resume as the ring drains
             seq.on_playback(ring.buffer_ms(rate), sink.real_played_ms(), now);
 
+            // Ring-depth probe: one row per 100 ms while a turn is active. Read
+            // next to the TTS arrivals, it separates "the model was quiet"
+            // from "the ring ran dry".
+            if (now - last_playback_trace_ms >= kPlaybackTraceMs) {
+                last_playback_trace_ms = now;
+                if (seq.turn_active()) {
+                    const int64_t base = seq.metrics().speech_start_ms;
+                    TimelineRow row;
+                    row.turn = seq.turn_id();
+                    row.stage = "playback";
+                    row.t_request_ms = base > 0 ? now - base : now;
+                    row.samples = ring.buffer_ms(rate);   // ring depth, ms
+                    row.audible_ms = sink.real_played_ms();  // real played, ms
+                    timeline_trace().add(std::move(row));
+                }
+            }
+
             // A barge-in that produced no follow-up speech still ends the turn.
             if (seq.state() == TurnState::Listening && now - last_event_ms > 3000)
                 seq.on_final(std::string(), now);
@@ -679,6 +819,11 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
     writer.finish();
     task.shutdown();
     arbiter.stop();
+
+    // Harness mode owns the file (it truncates once per invocation and appends
+    // every run); a single run writes its own timeline next to its WAV.
+    if (cfg.mode != "harness") write_timeline(timeline_path_for(cfg.out_dir));
+
     // run.ok is set only by a FinishTurn action: a turn that never completed
     // is reported as a failure instead of being masked.
     return run;

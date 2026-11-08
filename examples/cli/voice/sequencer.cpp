@@ -214,7 +214,7 @@ void SpeechSequencer::on_task_result(bool ok, const std::string& text,
     {
         std::deque<TextSegment> kept;
         for (auto& s : clauses_) {
-            if (s.kind == TextKind::Ack) {
+            if (s.kind == TextKind::Ack || s.kind == TextKind::Filler) {
                 ++stats_.fillers_dropped_stale;  // counted as stale speech
             } else {
                 kept.push_back(std::move(s));
@@ -262,10 +262,13 @@ void SpeechSequencer::feed_text(TextKind kind, const std::string& piece,
                                 int64_t t_ms, bool done) {
     if (!piece.empty()) pending_[(int)kind] += piece;
 
+    // Split at sentence boundaries, not every few words: each TTS piece
+    // boundary costs model lead/tail silence. The ack stays short by its own
+    // word cap; fillers are already short.
     const int max_words =
         kind == TextKind::Ack ? cfg_.ack_max_words
         : kind == TextKind::Filler ? cfg_.filler_max_words
-                                   : cfg_.clause_max_words;
+                                   : std::max(cfg_.clause_max_words, 40);
 
     std::string clause;
     while (take_clause(pending_[(int)kind], max_words, &clause)) {

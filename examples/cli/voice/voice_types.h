@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -195,6 +196,123 @@ struct TurnMetrics {
 };
 
 std::string metrics_json(const TurnMetrics& m);
+
+// ---------------------------------------------------------------------------
+// Per-piece timeline trace (timeline.csv).
+//
+// Diagnostics only: no policy reads this, and no existing metric changes
+// meaning because of it. The point is attribution — when the rendered WAV holds
+// a silent run, these rows say whether it was (a) a piece that starts with
+// silence, (b) the gap between two pieces, or (c) the playback ring starving.
+//
+// One row per TTS piece, one per LLM generation, and one per 100 ms of an
+// active turn for the playback ring. Times are milliseconds relative to the
+// turn's speech_start (the same base as metrics.jsonl) or -1 when not
+// applicable.
+//
+// Per-stage column meaning (the CSV keeps one fixed column set):
+//   stage=tts       samples = emitted PCM samples, audible_ms = samples above
+//                   threshold / rate, t_first_pcm = first emitted chunk,
+//                   t_first_audible = first chunk + offset of the first loud
+//                   10 ms window inside the piece (so model-padded leading
+//                   silence shows up as t_first_audible > t_first_pcm).
+//   stage=llm       t_first_pcm = first token (there is no PCM), samples =
+//                   token count, the *audible fields are -1/0.
+//   stage=playback  t_request_ms = sample time, samples = ring depth in ms,
+//                   audible_ms = real_played_ms, t_* others = -1.
+struct TimelineRow {
+    int run = 1;
+    int turn = 0;
+    std::string stage;  // "tts" | "llm" | "playback"
+    std::string kind;   // "ack" | "filler" | "answer" ("" for playback)
+    std::string text;   // one line, quotes escaped by the writer, <= 60 chars
+    int64_t t_request_ms = -1;
+    int64_t t_job_start_ms = -1;
+    int64_t t_first_pcm_ms = -1;
+    int64_t t_first_audible_ms = -1;
+    int64_t t_done_ms = -1;
+    int64_t samples = 0;
+    int64_t audible_ms = 0;
+};
+
+// Header line, including the trailing newline. Written once per file.
+const char* timeline_csv_header();
+// One CSV record, including the trailing newline.
+std::string timeline_csv_row(const TimelineRow& r);
+
+// Process-wide collector. Rows are produced from the arbiter thread and from
+// the control thread, so every access is mutex-guarded. One run at a time: the
+// orchestrator clears the rows when it starts, the harness stamps the run
+// number and copies them out when it ends.
+class TimelineTrace {
+   public:
+    void set_run(int run) {
+        std::lock_guard<std::mutex> lk(mu_);
+        run_ = run;
+        rows_.clear();
+    }
+    void clear_rows() {
+        std::lock_guard<std::mutex> lk(mu_);
+        rows_.clear();
+    }
+    int run() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return run_;
+    }
+    void add(TimelineRow row) {
+        std::lock_guard<std::mutex> lk(mu_);
+        row.run = run_;
+        rows_.push_back(std::move(row));
+    }
+    std::vector<TimelineRow> rows() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return rows_;
+    }
+
+   private:
+    mutable std::mutex mu_;
+    int run_ = 1;
+    std::vector<TimelineRow> rows_;
+};
+
+TimelineTrace& timeline_trace();
+
+// ---------------------------------------------------------------------------
+// Audibility scan for one emitted TTS piece.
+//
+// Scores the PCM the engine actually emitted in 10 ms windows and counts the
+// windows whose RMS reaches `threshold`. The first such window is the piece's
+// audible onset, which is what separates "the model emitted silence first"
+// from "the ring was empty".
+// ---------------------------------------------------------------------------
+class AudibilityMeter {
+   public:
+    explicit AudibilityMeter(int rate, double threshold = 0.01);
+
+    void push(const float* pcm, int n);   // one emitted chunk
+    void finish();                        // score a trailing partial window
+
+    bool found() const { return first_window_ >= 0; }
+    // Index of the first loud 10 ms window counted from the piece start.
+    int64_t first_window() const { return first_window_; }
+    int64_t window_ms() const { return window_ms_; }
+    int64_t total_samples() const { return total_samples_; }
+    int64_t audible_samples() const { return audible_samples_; }
+    int64_t audible_ms() const;
+
+   private:
+    void score_window();
+
+    double threshold_;
+    int window_samples_ = 160;
+    int64_t window_ms_ = 10;
+    int rate_ = 16000;
+    std::vector<float> pending_;
+    int64_t window_index_ = 0;
+    int64_t first_window_ = -1;
+    int64_t total_samples_ = 0;
+    int64_t audible_samples_ = 0;
+};
 
 }  // namespace voice
 }  // namespace crispasr

@@ -1,5 +1,0 @@
-run,warmup,speech_end_ms,final_transcript_ms,ack_text_ms,ack_first_pcm_ms,ack_first_played_ms,task_dispatch_ms,task_result_ms,answer_text_ms,answer_first_pcm_ms,answer_first_played_ms,end_ms,eos_to_first_played_ms,max_gap_ms,barge_ins,barge_in_stop_ms,fillers_played,tool_calls
-1,1,2114,2114,2208,2597,2606,2114,2115,2989,3887,4408,9184,492,0,0,0,5,0
-2,0,2114,2114,2210,2598,2607,2114,2117,2990,3887,4407,9187,493,0,0,0,5,0
-3,0,2114,2114,2209,2597,2607,2114,2116,2989,3887,4407,9182,493,0,0,0,5,0
-4,0,2114,2114,2210,2599,2608,2114,2117,2991,3888,4408,9189,494,0,0,0,5,0

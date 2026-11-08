@@ -3,9 +3,15 @@
 //
 // One process runs one scenario: warm-up runs first (unmeasured, they exist to
 // load models and warm caches), then N measured runs of run_once(). Per run we
-// write <out>/<scenario>/run<N>.wav, one JSONL metrics line and a CSV timeline
-// row; at the end we aggregate p50/p95 over the measured runs into summary.json
-// and print the table. tests/voice/check_metrics.py is the pass/fail gate.
+// write <out>/<scenario>/run<N>.wav, one JSONL metrics line and that run's
+// per-piece timeline rows; at the end we aggregate p50/p95 over the measured
+// runs into summary.json, print the table plus a per-kind piece summary, and
+// write timeline.csv with every run's rows.
+//
+// timeline.csv is the attribution tool, not a scoring one: it holds one row per
+// TTS piece, one per LLM generation and one per 100 ms of an active turn for
+// the playback ring (columns in voice_types.h). metrics.jsonl stays the scoring
+// record and check_metrics.py the gate.
 //
 // Engine timings are not Config fields, so they travel through the environment
 // (see engines_fake.cpp). The barge-in marker is one of them:
@@ -351,26 +357,66 @@ std::string annotate_metrics_line(const std::string& line, const std::string& sc
     return "{" + extra + "}";
 }
 
-const char* kTimelineHeader =
-    "run,warmup,speech_end_ms,final_transcript_ms,ack_text_ms,ack_first_pcm_ms,"
-    "ack_first_played_ms,task_dispatch_ms,task_result_ms,answer_text_ms,"
-    "answer_first_pcm_ms,answer_first_played_ms,end_ms,eos_to_first_played_ms,"
-    "max_gap_ms,barge_ins,barge_in_stop_ms,fillers_played,tool_calls\n";
+// Per-kind piece summary for the printed table: how many TTS pieces of each
+// kind a run produced and the largest silence between the audible onsets of two
+// consecutive pieces (attributed to the *later* piece). A big number against
+// `filler` means the filler queue ran dry; a big number against `answer` means
+// the answer's first PCM arrived late, which is a different fix.
+struct KindSummary {
+    int count = 0;
+    int64_t max_gap_ms = -1;
+    int64_t gap_run = 0;  // run whose gap is the max, for drilling into the CSV
+};
 
-std::string timeline_row(int run, bool warmup, const TurnMetrics& m) {
-    char buf[512];
-    std::snprintf(buf, sizeof(buf),
-                  "%d,%d,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%d,%lld,%d,%d\n",
-                  run, warmup ? 1 : 0, (long long)m.speech_end_ms,
-                  (long long)m.final_transcript_ms, (long long)m.ack_text_ms,
-                  (long long)m.ack_first_pcm_ms, (long long)m.ack_first_played_ms,
-                  (long long)m.task_dispatch_ms, (long long)m.task_result_ms,
-                  (long long)m.answer_text_ms, (long long)m.answer_first_pcm_ms,
-                  (long long)m.answer_first_played_ms, (long long)m.end_ms,
-                  (long long)m.eos_to_first_played_ms(), (long long)m.max_gap_ms(),
-                  m.barge_ins, (long long)m.barge_in_stop_ms, m.fillers_played,
-                  m.tool_calls);
-    return std::string(buf);
+void print_piece_summary(const std::vector<std::vector<TimelineRow>>& runs) {
+    std::map<std::string, KindSummary> by_kind;
+    KindSummary all;
+    for (const auto& rows : runs) {
+        std::vector<const TimelineRow*> tts;
+        for (const TimelineRow& r : rows) {
+            if (r.stage == "tts") tts.push_back(&r);
+        }
+        std::stable_sort(tts.begin(), tts.end(),
+                         [](const TimelineRow* a, const TimelineRow* b) {
+                             return a->t_first_audible_ms < b->t_first_audible_ms;
+                         });
+        int64_t prev = -1;
+        for (const TimelineRow* r : tts) {
+            KindSummary& s = by_kind[r->kind];
+            ++s.count;
+            ++all.count;
+            // A piece that never became audible (flushed by a barge-in, or the
+            // engine returned nothing) counts as a piece but has no onset, so
+            // it cannot bound a gap.
+            if (r->t_first_audible_ms < 0) continue;
+            if (prev >= 0) {
+                const int64_t gap = r->t_first_audible_ms - prev;
+                if (gap > s.max_gap_ms) {
+                    s.max_gap_ms = gap;
+                    s.gap_run = r->run;
+                }
+                if (gap > all.max_gap_ms) {
+                    all.max_gap_ms = gap;
+                    all.gap_run = r->run;
+                }
+            }
+            prev = r->t_first_audible_ms;
+        }
+    }
+    if (by_kind.empty()) return;
+    auto gap_str = [](int64_t gap) {
+        return gap < 0 ? std::string("-") : std::to_string((long long)gap);
+    };
+    std::printf("timeline: tts pieces, audible-onset gap to the previous piece\n");
+    std::printf("%-12s %6s %12s %6s\n", "kind", "count", "max_gap_ms", "run");
+    for (const auto& kv : by_kind) {
+        std::printf("%-12s %6d %12s %6lld\n", kv.first.c_str(), kv.second.count,
+                    gap_str(kv.second.max_gap_ms).c_str(),
+                    (long long)kv.second.gap_run);
+    }
+    std::printf("%-12s %6d %12s %6lld\n", "all", all.count,
+                gap_str(all.max_gap_ms).c_str(), (long long)all.gap_run);
+    std::fflush(stdout);
 }
 
 void print_table(const std::string& name, int runs, int warmup, int failed,
@@ -459,8 +505,10 @@ int run_harness(const Config& cfg_in, const std::string& scenario_path) {
 
     const int total_runs = cfg.warmup_runs + cfg.runs;
     std::vector<std::string> jsonl;
-    std::string timeline = kTimelineHeader;
+    std::string timeline = timeline_csv_header();
     std::vector<TurnMetrics> measured;
+    // Timeline rows of the measured runs, for the printed piece summary.
+    std::vector<std::vector<TimelineRow>> measured_rows;
     int failed = 0;
 
     for (int run = 1; run <= total_runs; ++run) {
@@ -469,7 +517,11 @@ int run_harness(const Config& cfg_in, const std::string& scenario_path) {
         std::printf("harness: run %d/%d%s ... ", run, total_runs, warmup ? " (warm-up)" : "");
         std::fflush(stdout);
 
+        // The run number travels into the process-wide trace, so every row the
+        // run produces carries it.
+        timeline_trace().set_run(run);
         LoopRun result = run_once(cfg, engines, sc.input_wav, out_wav);
+        std::vector<TimelineRow> run_rows = timeline_trace().rows();
         if (!result.ok) {
             ++failed;
             std::printf("FAILED: %s\n", result.error.c_str());
@@ -481,8 +533,11 @@ int run_harness(const Config& cfg_in, const std::string& scenario_path) {
         }
 
         jsonl.push_back(annotate_metrics_line(metrics_json(result.metrics), sc.name, run, warmup));
-        timeline += timeline_row(run, warmup, result.metrics);
-        if (!warmup) measured.push_back(result.metrics);
+        for (const TimelineRow& row : run_rows) timeline += timeline_csv_row(row);
+        if (!warmup) {
+            measured.push_back(result.metrics);
+            measured_rows.push_back(std::move(run_rows));
+        }
     }
 
     // ---- aggregate -------------------------------------------------------
@@ -503,6 +558,7 @@ int run_harness(const Config& cfg_in, const std::string& scenario_path) {
     }
 
     print_table(sc.name, cfg.runs, cfg.warmup_runs, failed, rows);
+    print_piece_summary(measured_rows);
 
     // ---- files -----------------------------------------------------------
     const std::string jsonl_path = scen_dir + "/metrics.jsonl";

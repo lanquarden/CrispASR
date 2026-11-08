@@ -161,3 +161,6 @@ tools/kaggle/*/kaggle_harness.py
 # .NET build output for the C# binding (dotnet build/test writes these in place)
 /bindings/csharp/**/bin/
 /bindings/csharp/**/obj/
+
+# Voice-loop harness outputs (regenerated per run)
+/tests/voice/out/

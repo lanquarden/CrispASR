@@ -138,3 +138,61 @@ VOICE_REAL_ENGINES=1 build-vk/bin/crispasr-voice \
 - Sweep `low/target/high` watermarks and `clause_max_words`; report the table.
 - LLM-generated filler behind the existing bank interface (`--filler llm`).
 - Real-engine `barge_in` and `short` runs; ES smoke.
+
+
+## Comparison with huggingface/speech-to-speech
+
+Read at commit `327a8c1` (`/tmp/hf-s2s`). What they do that is relevant:
+
+- **Sentence batching before TTS** (`LLM/language_model.py:194`,
+  `stream_batch_sentences=3`): fewer TTS piece boundaries.
+- **Per-piece silence trimming** (Kokoro: 250 ms leading, 120-sample pad;
+  Phonon: a streaming `_TrailingSilenceTrimmer` that holds quiet frames and
+  restores them if speech resumes).
+- **Sample-anchored latency origin** (`VAD/vad_handler.py:838-843`):
+  `speech_end_sample` from the sample count, not from when VAD declared the
+  end, so queue delay does not leak into the metric.
+- **Generation-counter cancel** (`pipeline/cancel_scope.py`) plus queue flush on
+  `SpeechStartedEvent` (`websocket_router.py:1002-1022`). Equivalent to our
+  epoch counter.
+- **Played-sample accounting** (`demo/worklets/audio-playback.js`): frames
+  actually written plus `queuedMs`, and a sample-accurate interruption test in
+  `node:vm`.
+- **Testing**: fake `perf_counter`, a `RecordingTransport`, and protocol
+  conformance asserted through the OpenAI SDK's own event union. No GPU and no
+  human in the loop.
+
+What they admit they do not solve, and we must not copy:
+
+- `docs/response-latency.md`: E2E ends at the first *yielded TTS block*, "not
+  browser playback"; no p50/p95; underruns visible only at the end of a turn.
+- No filler/glue phrases, no speculative text generation, no A2A. Their
+  speculation is turn segmentation only.
+
+Port decisions (after adversarial review):
+
+| idea | verdict | reason |
+|---|---|---|
+| audible-origin headline + p50/p95 | **port** | our 251-275 ms is buffer-side; WAV-derived audible is the real number |
+| fewer TTS pieces (sentence-based clauses) | **adapt** | batching calls 3x longer on a serialized arbiter can enlarge the worst gap; stop splitting at 6 words first |
+| hold-and-restore tail trimmer | drop | our pieces are complete at enqueue; restoring held silence can reinsert noise |
+| sample-anchored gap metric as a second source | drop | two thresholds drift from the WAV check; keep one truth |
+| duck-don't-mute | drop | no measured echo events; HF ships real AEC3 for a reason |
+| fake clock for scenario tests | adapt | unit tests only; the failing defect is wall-clock native |
+
+## Measurement bases (found while porting the audible metric)
+
+Two clocks were being mixed:
+
+- `metrics.jsonl` timestamps are relative to **VAD speech start**; the rendered
+  WAV starts at the loop's `t0` (before the input lead-in), so a constant
+  ~0.6 s offset separates them.
+- `speech_end_ms` is when **VAD declared** the end (after `min_silence_ms`),
+  ~300-900 ms after the last audible input sample.
+
+Consequences: `eos_to_first_played` is measured from a late end reference and
+therefore understates latency; the "silence after ack_first_played" column in
+the first checker report was a mixed-base artifact (~573 ms ≈ the speech-start
+offset), not audio. The WAV-derived **`eos_to_first_audible_ms`** (first
+10 ms RMS>0.01 in the output WAV minus the last audible frame of the input WAV)
+is the only number comparable across runs, and it is now the headline.

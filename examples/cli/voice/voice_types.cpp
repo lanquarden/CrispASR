@@ -6,7 +6,10 @@
 #include "voice_types.h"
 
 #include <chrono>
+#include <cmath>
 #include <cstddef>
+#include <cstdio>
+#include <mutex>
 #include <string>
 
 namespace crispasr {
@@ -250,6 +253,121 @@ std::string metrics_json(const TurnMetrics& m) {
 
     out += '}';
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// Timeline CSV
+// ---------------------------------------------------------------------------
+const char* timeline_csv_header() {
+    return "run,turn,stage,kind,text,t_request_ms,t_job_start_ms,"
+           "t_first_pcm_ms,t_first_audible_ms,t_done_ms,samples,audible_ms\n";
+}
+
+namespace {
+
+// CSV text field: always quoted, inner quotes doubled, one line, <= 60 chars.
+// TTS text is user/model output, so both delimiters and control characters have
+// to be neutralised or the file stops being machine-readable.
+std::string csv_text(const std::string& in, size_t max_chars = 60) {
+    std::string flat;
+    flat.reserve(in.size());
+    size_t chars = 0;
+    bool pending_space = false;
+    for (unsigned char c : in) {
+        if (c == '\n' || c == '\r' || c == '\t' || c == ' ') {
+            pending_space = !flat.empty();
+            continue;
+        }
+        if (c < 0x20) continue;
+        if (pending_space) {
+            if (chars >= max_chars) break;
+            flat.push_back(' ');
+            ++chars;
+            pending_space = false;
+        }
+        // Count a UTF-8 sequence once and never cut it in half.
+        if ((c & 0xC0) != 0x80) {
+            if (chars >= max_chars) break;
+            ++chars;
+        }
+        flat.push_back((char)c);
+    }
+    std::string out;
+    out.reserve(flat.size() + 2);
+    out += '"';
+    for (char c : flat) {
+        if (c == '"') out += '"';
+        out += c;
+    }
+    out += '"';
+    return out;
+}
+
+}  // namespace
+
+std::string timeline_csv_row(const TimelineRow& r) {
+    char buf[512];
+    std::snprintf(buf, sizeof(buf), "%d,%d,%s,%s,", r.run, r.turn, r.stage.c_str(),
+                  r.kind.c_str());
+    std::string out(buf);
+    out += csv_text(r.text);
+    std::snprintf(buf, sizeof(buf), ",%lld,%lld,%lld,%lld,%lld,%lld,%lld\n",
+                  (long long)r.t_request_ms, (long long)r.t_job_start_ms,
+                  (long long)r.t_first_pcm_ms, (long long)r.t_first_audible_ms,
+                  (long long)r.t_done_ms, (long long)r.samples,
+                  (long long)r.audible_ms);
+    out += buf;
+    return out;
+}
+
+TimelineTrace& timeline_trace() {
+    static TimelineTrace trace;
+    return trace;
+}
+
+// ---------------------------------------------------------------------------
+// Audibility scan
+// ---------------------------------------------------------------------------
+AudibilityMeter::AudibilityMeter(int rate, double threshold) {
+    rate_ = rate > 0 ? rate : 16000;
+    threshold_ = threshold;
+    window_samples_ = rate_ / 100;  // 10 ms
+    if (window_samples_ < 1) window_samples_ = 1;
+    window_ms_ = (int64_t)window_samples_ * 1000 / rate_;
+    if (window_ms_ < 1) window_ms_ = 1;
+    pending_.reserve((size_t)window_samples_);
+}
+
+void AudibilityMeter::push(const float* pcm, int n) {
+    if (pcm == nullptr || n <= 0) return;
+    total_samples_ += n;
+    for (int i = 0; i < n; ++i) {
+        pending_.push_back(pcm[i]);
+        if ((int)pending_.size() == window_samples_) score_window();
+    }
+}
+
+void AudibilityMeter::finish() {
+    if (!pending_.empty()) score_window();
+}
+
+void AudibilityMeter::score_window() {
+    double sum = 0.0;
+    for (float s : pending_) sum += (double)s * (double)s;
+    const double rms = pending_.empty()
+                           ? 0.0
+                           : std::sqrt(sum / (double)pending_.size());
+    if (rms >= threshold_) {
+        if (first_window_ < 0) first_window_ = window_index_;
+        audible_samples_ += (int64_t)pending_.size();
+    }
+    ++window_index_;
+    pending_.clear();
+}
+
+int64_t AudibilityMeter::audible_ms() const {
+    if (rate_ <= 0) return 0;
+    return audible_samples_ * 1000 / rate_;
 }
 
 }  // namespace voice
