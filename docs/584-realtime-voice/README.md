@@ -64,7 +64,7 @@ docs/584-realtime-voice/
 ## Build and run
 
 ```sh
-# CMake target (once the consolidation lands)
+# CMake target (consolidated)
 cmake -S . -B build-vk -G Ninja -DCMAKE_MAKE_PROGRAM=/usr/bin/ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DSPIRV-Headers_DIR=$(brew --prefix spirv-headers)/share/cmake/SPIRV-Headers

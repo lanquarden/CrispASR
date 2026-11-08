@@ -11,6 +11,22 @@
 
 set(TARGET crispasr-cli)
 
+# Build-system consolidation: the CLI adapters are shared with the realtime
+# voice loop (`crispasr-voice`, voice/*.cpp). Putting every CLI source except
+# cli.cpp (which owns main()) into an OBJECT library means both executables
+# are built from the same objects instead of compiling ~100 adapters twice.
+# Compile definitions, include directories and link libraries live on the
+# object library as PUBLIC so the CLI and the voice loop both inherit them;
+# only `cli.cpp` and the voice `main()` stay per-executable.
+set(CRISPASR_CLI_OBJ crispasr-cli-objects)
+
+# DefaultTargetOptions() reads the `TARGET` variable from its enclosing scope.
+# Reuse it verbatim for a target named by argument.
+function(crispasr_cli_default_target_options target)
+    set(TARGET ${target})
+    include(DefaultTargetOptions)
+endfunction()
+
 # The CLI records consent hashes even when C2PA signing is disabled.  Its
 # header therefore uses the shared SHA-256 shim independently of
 # crispasr_enable_c2pa(), which only configures the optional signing library.
@@ -22,8 +38,7 @@ if (NOT EXISTS "${_crispasr_c2pa_audio_include}/sha256.h")
         "git submodule update --init --recursive")
 endif()
 
-add_executable(${TARGET}
-    cli.cpp
+set(CRISPASR_CLI_SHARED_SOURCES
     crispasr_backend.cpp
     crispasr_backend_crispasr.cpp
     crispasr_backend_nemotron.cpp
@@ -140,6 +155,10 @@ add_executable(${TARGET}
     wyoming.cpp
 )
 
+add_library(${CRISPASR_CLI_OBJ} OBJECT ${CRISPASR_CLI_SHARED_SOURCES})
+add_executable(${TARGET} cli.cpp)
+target_link_libraries(${TARGET} PRIVATE ${CRISPASR_CLI_OBJ})
+
 # ---------------------------------------------------------------------------
 # Build-info macros surfaced to crispasr_diagnostics.cpp. Together they
 # answer "what exact bits am I running?" — important for bug reports
@@ -153,7 +172,7 @@ if (NOT DEFINED GIT_SHA1)
     include(${CMAKE_SOURCE_DIR}/cmake/git-vars.cmake)
 endif()
 string(TIMESTAMP CRISPASR_BUILD_DATE_STR "%Y-%m-%dT%H:%M:%SZ" UTC)
-target_compile_definitions(${TARGET} PRIVATE
+target_compile_definitions(${CRISPASR_CLI_OBJ} PUBLIC
     CRISPASR_VERSION_STR="${PROJECT_VERSION}"
     CRISPASR_GIT_SHA1="${GIT_SHA1}"
     CRISPASR_GIT_DATE="${GIT_DATE}"
@@ -181,7 +200,7 @@ if (GGML_CUDA)
     # ("LNK1181: cannot open input file 'GIT_DATE.obj'"). Convert the
     # separator to "," before embedding so it remains a single token.
     string(REPLACE ";" "," CRISPASR_CUDA_ARCHS_STR "${CMAKE_CUDA_ARCHITECTURES}")
-    target_compile_definitions(${TARGET} PRIVATE
+    target_compile_definitions(${CRISPASR_CLI_OBJ} PUBLIC
         CRISPASR_HAVE_CUDA=1
         CRISPASR_CUDA_VERSION="${CUDAToolkit_VERSION}"
         CRISPASR_CUDA_RUNTIME_MAJOR="${CRISPASR_CUDA_RUNTIME_MAJOR}"
@@ -189,25 +208,25 @@ if (GGML_CUDA)
     )
 endif()
 if (GGML_METAL)
-    target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_METAL=1)
+    target_compile_definitions(${CRISPASR_CLI_OBJ} PUBLIC CRISPASR_HAVE_METAL=1)
 endif()
 if (GGML_VULKAN)
-    target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_VULKAN=1)
+    target_compile_definitions(${CRISPASR_CLI_OBJ} PUBLIC CRISPASR_HAVE_VULKAN=1)
 endif()
 if (GGML_HIP)
-    target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_HIP=1)
+    target_compile_definitions(${CRISPASR_CLI_OBJ} PUBLIC CRISPASR_HAVE_HIP=1)
 endif()
 if (GGML_SYCL)
-    target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_SYCL=1)
+    target_compile_definitions(${CRISPASR_CLI_OBJ} PUBLIC CRISPASR_HAVE_SYCL=1)
 endif()
 if (GGML_OPENCL)
-    target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_OPENCL=1)
+    target_compile_definitions(${CRISPASR_CLI_OBJ} PUBLIC CRISPASR_HAVE_OPENCL=1)
 endif()
 if (GGML_BLAS)
-    target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_BLAS=1)
+    target_compile_definitions(${CRISPASR_CLI_OBJ} PUBLIC CRISPASR_HAVE_BLAS=1)
 endif()
 if (GGML_MUSA)
-    target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_MUSA=1)
+    target_compile_definitions(${CRISPASR_CLI_OBJ} PUBLIC CRISPASR_HAVE_MUSA=1)
 endif()
 
 # ---------------------------------------------------------------------------
@@ -373,14 +392,15 @@ endif()
 set_target_properties(${TARGET} PROPERTIES OUTPUT_NAME crispasr)
 
 # httplib.h is in the server example directory
-target_include_directories(${TARGET} PRIVATE
+target_include_directories(${CRISPASR_CLI_OBJ} PUBLIC
     ${CMAKE_SOURCE_DIR}/examples/server
     ${_crispasr_c2pa_audio_include}
 )
 
 include(DefaultTargetOptions)
+crispasr_cli_default_target_options(${CRISPASR_CLI_OBJ})
 
-target_link_libraries(${TARGET} PRIVATE
+target_link_libraries(${CRISPASR_CLI_OBJ} PUBLIC
     common
     crispasr-lib
     parakeet
@@ -459,32 +479,32 @@ target_link_libraries(${TARGET} PRIVATE
 )
 
 if (CRISPASR_CURL)
-    target_compile_definitions(${TARGET} PRIVATE CRISPASR_USE_LIBCURL)
+    target_compile_definitions(${CRISPASR_CLI_OBJ} PUBLIC CRISPASR_USE_LIBCURL)
 endif()
 
 # Optional outetts backend (source files may not be present in all checkouts)
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/crispasr_backend_outetts.cpp")
-    target_sources(${TARGET} PRIVATE crispasr_backend_outetts.cpp)
-    target_link_libraries(${TARGET} PRIVATE outetts)
-    target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_OUTETTS=1)
+    target_sources(${CRISPASR_CLI_OBJ} PRIVATE crispasr_backend_outetts.cpp)
+    target_link_libraries(${CRISPASR_CLI_OBJ} PUBLIC outetts)
+    target_compile_definitions(${CRISPASR_CLI_OBJ} PUBLIC CRISPASR_HAVE_OUTETTS=1)
 endif()
 
 # Optional parler-tts backend
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/crispasr_backend_parler.cpp")
-    target_link_libraries(${TARGET} PRIVATE parler-tts)
+    target_link_libraries(${CRISPASR_CLI_OBJ} PUBLIC parler-tts)
 endif()
 
 # MP3 output — in-tree glint encoder (glint/), always available.
-target_link_libraries(${TARGET} PRIVATE glint)
+target_link_libraries(${CRISPASR_CLI_OBJ} PUBLIC glint)
 
 # Optional libmp3lame fallback (used if glint fails, or forced with
 # CRISPASR_MP3_ENCODER=lame for A/B comparisons)
 find_library(LAME_LIBRARY NAMES mp3lame)
 find_path(LAME_INCLUDE_DIR lame/lame.h)
 if (LAME_LIBRARY AND LAME_INCLUDE_DIR)
-    target_link_libraries(${TARGET} PRIVATE ${LAME_LIBRARY})
-    target_include_directories(${TARGET} PRIVATE ${LAME_INCLUDE_DIR})
-    target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_LAME=1)
+    target_link_libraries(${CRISPASR_CLI_OBJ} PUBLIC ${LAME_LIBRARY})
+    target_include_directories(${CRISPASR_CLI_OBJ} PUBLIC ${LAME_INCLUDE_DIR})
+    target_compile_definitions(${CRISPASR_CLI_OBJ} PUBLIC CRISPASR_HAVE_LAME=1)
     message(STATUS "MP3 output: glint + libmp3lame fallback")
 else()
     message(STATUS "MP3 output: glint (libmp3lame fallback not found)")
@@ -494,15 +514,16 @@ endif()
 find_library(OPUS_LIBRARY NAMES opus)
 find_path(OPUS_INCLUDE_DIR opus/opus.h)
 if (OPUS_LIBRARY AND OPUS_INCLUDE_DIR)
-    target_link_libraries(${TARGET} PRIVATE ${OPUS_LIBRARY})
-    target_include_directories(${TARGET} PRIVATE ${OPUS_INCLUDE_DIR})
-    target_compile_definitions(${TARGET} PRIVATE CRISPASR_HAVE_OPUS=1)
+    target_link_libraries(${CRISPASR_CLI_OBJ} PUBLIC ${OPUS_LIBRARY})
+    target_include_directories(${CRISPASR_CLI_OBJ} PUBLIC ${OPUS_INCLUDE_DIR})
+    target_compile_definitions(${CRISPASR_CLI_OBJ} PUBLIC CRISPASR_HAVE_OPUS=1)
     message(STATUS "Opus output enabled (libopus)")
 else()
     message(STATUS "Opus output disabled (libopus-dev not found)")
 endif()
 
 # C2PA (Content Credentials) signing — shared logic in cmake/CrispasrC2pa.cmake.
+crispasr_enable_c2pa(${CRISPASR_CLI_OBJ})
 crispasr_enable_c2pa(${TARGET})
 
 install(TARGETS ${TARGET} RUNTIME BUNDLE DESTINATION bin)
@@ -543,6 +564,36 @@ endif()
 include(DefaultTargetOptions)
 
 if(TARGET moonshine_onnx)
-    target_sources(${TARGET} PRIVATE crispasr_backend_moonshine_onnx.cpp)
-    target_link_libraries(${TARGET} PRIVATE moonshine_onnx)
+    target_sources(${CRISPASR_CLI_OBJ} PRIVATE crispasr_backend_moonshine_onnx.cpp)
+    target_link_libraries(${CRISPASR_CLI_OBJ} PUBLIC moonshine_onnx)
+endif()
+
+# ---------------------------------------------------------------------------
+# crispasr-voice — realtime voice-loop experiment (issue #584).
+#
+# Reuses the CLI adapter objects (crispasr-cli-objects) instead of compiling
+# them a second time; only voice/*.cpp are new translation units.
+#
+# Gated on CRISPASR_BUILD_VOICE (top-level CMakeLists.txt, default ON). This
+# file is only entered when examples/cli is built, so the target never
+# appears in binding / common-only builds.
+# ---------------------------------------------------------------------------
+if (CRISPASR_BUILD_VOICE)
+    file(GLOB CRISPASR_VOICE_SOURCES CONFIGURE_DEPENDS
+        ${CMAKE_CURRENT_SOURCE_DIR}/voice/*.cpp)
+    if (NOT CRISPASR_VOICE_SOURCES)
+        message(FATAL_ERROR "CRISPASR_BUILD_VOICE is ON but ${CMAKE_CURRENT_SOURCE_DIR}/voice has no sources")
+    endif()
+    list(SORT CRISPASR_VOICE_SOURCES)
+
+    add_executable(crispasr-voice ${CRISPASR_VOICE_SOURCES})
+    # voice/*.cpp include CLI headers (crispasr_backend.h, whisper_params.h)
+    # and each other by bare file name.
+    target_include_directories(crispasr-voice PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/voice
+    )
+    target_link_libraries(crispasr-voice PRIVATE ${CRISPASR_CLI_OBJ})
+    crispasr_cli_default_target_options(crispasr-voice)
+    install(TARGETS crispasr-voice RUNTIME BUNDLE DESTINATION bin)
 endif()

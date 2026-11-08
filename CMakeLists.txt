@@ -134,6 +134,9 @@ endif()
 option(CRISPASR_BUILD_TESTS    "crispasr: build tests"          ${CRISPASR_STANDALONE})
 option(CRISPASR_BUILD_EXAMPLES "crispasr: build examples"       ${CRISPASR_STANDALONE})
 option(CRISPASR_BUILD_SERVER   "crispasr: build server example" ${CRISPASR_STANDALONE})
+# Realtime voice-loop experiment (crispasr-voice). Lives next to the CLI and
+# reuses its adapter objects, so it is only added when examples/cli is built.
+option(CRISPASR_BUILD_VOICE    "crispasr: build the realtime voice-loop experiment (crispasr-voice)" ON)
 option(CRISPASR_BUILD_SCNET_PROBE "Build isolated SCNet parity/benchmark tools" OFF)
 # The opt-in probe includes a shared validation library even in static builds.
 # Enable PIC before creating ggml and backend targets so its static dependencies

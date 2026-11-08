@@ -106,7 +106,22 @@ def main():
         objects.append(obj)
 
     # Reuse every CLI adapter object except the one that defines main().
-    cli_obj_dir = os.path.join(build_path, "examples", "cli", "CMakeFiles", "crispasr-cli.dir")
+    # After the CMake consolidation the adapters live in crispasr-cli-objects;
+    # older build trees kept them in crispasr-cli.dir. Prefer the objects dir so
+    # a clean tree works, fall back for pre-consolidation caches.
+    candidates = [
+        os.path.join(build_path, "examples", "cli", "CMakeFiles", "crispasr-cli-objects.dir"),
+        os.path.join(build_path, "examples", "cli", "CMakeFiles", "crispasr-cli.dir"),
+    ]
+    cli_obj_dir = None
+    for cand in candidates:
+        if os.path.isdir(cand) and any(
+                f.endswith(".o") and f != "cli.cpp.o"
+                for _b, _d, fs in os.walk(cand) for f in fs):
+            cli_obj_dir = cand
+            break
+    if cli_obj_dir is None:
+        sys.exit("no adapter objects found; build bin/crispasr first")
     cli_objects = []
     for base, _dirs, files in os.walk(cli_obj_dir):
         for f in files:
@@ -142,7 +157,8 @@ def main():
         libs.append(p)
         i += 1
 
-    out_bin = os.path.join(build_path, "bin", "crispasr-voice")
+    # Distinct name: the CMake target owns bin/crispasr-voice.
+    out_bin = os.path.join(build_path, "bin", "crispasr-voice-dev")
     cmd = ["c++"] + objects + cli_objects + libs + ["-o", out_bin]
     if verbose:
         print(" ".join(shlex.quote(c) for c in cmd))
