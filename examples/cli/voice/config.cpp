@@ -644,6 +644,7 @@ Config config_from_args(int argc, char** argv) {
         else if (flag == "--vad-min-silence-ms") int_flag(&cfg.vad_min_silence_ms);
         else if (flag == "--vad-min-speech-ms") int_flag(&cfg.vad_min_speech_ms);
         else if (flag == "--clause-max-words") int_flag(&cfg.clause_max_words);
+        else if (flag == "--language") cfg.language = value();
         else if (flag == "--task-ms") {
             int_flag(&cfg.task_ms);
             g_extras.task_ms_set = true;

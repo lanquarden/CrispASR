@@ -5,8 +5,10 @@
 //   --harness <scenario.json>  automated measurement run (fake or real engines)
 //   --input in.wav --out out.wav   one turn with the real engines
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "arbiter.h"
 #include "audio_io.h"
@@ -14,6 +16,7 @@
 #include "engines.h"
 #include "harness.h"
 #include "sequencer.h"
+#include "tool_call.h"
 #include "voice_loop.h"
 #include "voice_types.h"
 
@@ -137,6 +140,75 @@ int selftest_impl() {
         check(!dup && spoken.size() >= 2, "bank fillers do not repeat");
     }
 
+    // 7. tool-call parser: lenient about packaging, strict about content.
+    {
+        const ToolCall c = parse_tool_call(
+            "```json\n{\"tool\":\"device_status\",\"args\":{\"device\":\"garage\"}}\n```");
+        check(c.valid && c.tool == ToolId::DeviceStatus && c.device == "garage",
+              "tool: fenced JSON parses");
+    }
+    {
+        const ToolCall c = parse_tool_call("set_timer");
+        check(c.valid && c.tool == ToolId::SetTimer && c.minutes == 5,
+              "tool: bare tool name accepted (minutes defaulted)");
+    }
+    {
+        const ToolCall c =
+            parse_tool_call("Sure, on it. {\"tool\":\"smalltalk\",\"args\":{}} Done.");
+        check(c.valid && c.tool == ToolId::Smalltalk,
+              "tool: extra prose around the object tolerated");
+    }
+    {
+        const ToolCall c =
+            parse_tool_call(
+                "\"{\\\"tool\\\":\\\"device_status\\\",\\\"args\\\":{\\\"device\\\":\\\"lights\\\"}}\"");
+        check(c.valid && c.tool == ToolId::DeviceStatus && c.device == "lights",
+              "tool: JSON inside a quoted string unwrapped");
+    }
+    {
+        const ToolCall c = parse_tool_call(
+            "{\"tool\":\"set_timer\",\"args\":{\"minutes\":\"abc\"}}");
+        check(!c.valid && c.tool == ToolId::SetTimer,
+              "tool: non-numeric minutes rejected");
+    }
+    {
+        const ToolCall c =
+            parse_tool_call("{\"tool\":\"set_timer\",\"args\":{\"minutes\":\"7\"}}");
+        check(c.valid && c.tool == ToolId::SetTimer && c.minutes == 7,
+              "tool: numeric string coerced");
+    }
+    {
+        const ToolCall c = parse_tool_call("{\"tool\":\"open_garage\",\"args\":{}}");
+        check(!c.valid && c.tool == ToolId::Unknown, "tool: unknown tool rejected");
+    }
+    {
+        const ToolCall c = parse_tool_call(
+            "{\"tool\":\"device_status\",\"args\":{\"device\":\"gar");
+        check(!c.valid, "tool: truncated JSON rejected");
+    }
+    {
+        const ToolCall c =
+            parse_tool_call("{\"tool\":\"device_status\",\"args\":{\"device\":7}}");
+        check(!c.valid, "tool: wrong device type rejected");
+    }
+    {
+        const ToolCall c =
+            parse_tool_call("{\"tool\":\"set_timer\",\"args\":{\"minutes\":9999}}");
+        check(!c.valid, "tool: out-of-range minutes rejected");
+    }
+    {
+        const ToolCall c = parse_tool_call("I think I should check the garage door for you.");
+        check(!c.valid && c.tool == ToolId::Unknown, "tool: plain prose rejected");
+    }
+    {
+        const ToolProfile dev = tool_profile(ToolId::DeviceStatus, cfg);
+        const ToolProfile timer = tool_profile(ToolId::SetTimer, cfg);
+        const ToolProfile talk = tool_profile(ToolId::Smalltalk, cfg);
+        check(dev.latency_ms == cfg.task_ms && timer.latency_ms > 0 &&
+                  timer.latency_ms <= 1000 && talk.latency_ms == 0,
+              "tool: latency profiles 6 s / <=1 s / 0");
+    }
+
     std::printf("%d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
 }
@@ -144,10 +216,54 @@ int selftest_impl() {
 }  // namespace
 
 int main(int argc, char** argv) {
-    for (int i = 1; i < argc; ++i)
-        if (std::strcmp(argv[i], "--selftest") == 0) return selftest_impl();
+    // --tool-mode belongs to the tool-call experiment, and config.cpp is not
+    // this milestone's file: consume it here, put it in the environment (where
+    // tool_call.cpp reads it), and drop it from the argv config.cpp sees.
+    std::vector<std::string> owned;
+    owned.reserve((size_t)(argc > 0 ? argc : 0));
+    if (argc > 0) owned.push_back(argv[0] ? argv[0] : "crispasr-voice");
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i] ? argv[i] : "";
+        std::string value;
+        bool is_tool_mode = false;
+        if (arg == "--tool-mode") {
+            is_tool_mode = true;
+            if (i + 1 < argc) {
+                ++i;
+                value = argv[i] ? argv[i] : "";
+            }
+        } else if (arg.rfind("--tool-mode=", 0) == 0) {
+            is_tool_mode = true;
+            value = arg.substr(std::strlen("--tool-mode="));
+        }
+        if (!is_tool_mode) {
+            owned.push_back(arg);
+            continue;
+        }
+        ToolMode m = ToolMode::Llm;
+        if (!parse_tool_mode(value, &m)) {
+            std::fprintf(stderr,
+                         "warning: --tool-mode expects off|llm|fake_valid|fake_invalid, "
+                         "got '%s'\n",
+                         value.c_str());
+            continue;
+        }
+#if defined(_WIN32)
+        _putenv_s("VOICE_TOOL_MODE", to_string(m));
+#else
+        ::setenv("VOICE_TOOL_MODE", to_string(m), 1);
+#endif
+    }
+    std::vector<char*> av;
+    av.reserve(owned.size());
+    for (std::string& s : owned) av.push_back(const_cast<char*>(s.c_str()));
+    char** argv_owned = av.empty() ? argv : av.data();
+    const int argc_owned = av.empty() ? argc : (int)av.size();
 
-    Config cfg = config_from_args(argc, argv);
+    for (int i = 1; i < argc_owned; ++i)
+        if (std::strcmp(argv_owned[i], "--selftest") == 0) return selftest_impl();
+
+    Config cfg = config_from_args(argc_owned, argv_owned);
 
     const CliExtras& x = config_extras();
     if (cfg.mode == "selftest")
@@ -158,7 +274,8 @@ int main(int argc, char** argv) {
     if (x.input_wav.empty() || cfg.out_dir.empty() || cfg.out_dir == ".") {
         std::fprintf(stderr,
                      "usage: crispasr-voice --selftest\n"
-                     "       crispasr-voice --harness scenario.json\n"
+                     "       crispasr-voice --harness scenario.json "
+                     "[--tool-mode off|llm|fake_valid|fake_invalid]\n"
                      "       crispasr-voice --input in.wav --out out.wav "
                      "--asr-model ... --tts-model ... --chat-model ...\n");
         return 2;

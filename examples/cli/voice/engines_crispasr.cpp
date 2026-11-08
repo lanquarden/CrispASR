@@ -530,7 +530,7 @@ class CrispasrTtsEngine : public TtsEngine {
         p_.n_threads = 8;
         p_.use_gpu = true;
         p_.gpu_backend = "vulkan";
-        p_.target_lang = "en";
+        p_.target_lang = cfg_.language;
         be_ = crispasr_create_backend(cfg_.tts_backend);
         if (!be_) return false;
         if (!be_->init(p_)) {

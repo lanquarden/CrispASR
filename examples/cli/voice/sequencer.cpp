@@ -82,23 +82,60 @@ bool take_clause(std::string& pending, int max_words, std::string* out) {
 }
 
 // Quotes and markdown are not speech: qwen3-tts renders them as long pauses.
+// Emoji and symbol codepoints are the same class of noise (a smiley becomes a
+// pause or a vocalisation), and the model emits them when the LLM answers with
+// an emoji. Latin accents (es/fr/de) must survive, so only known symbol blocks
+// are dropped.
+bool is_symbol_codepoint(uint32_t cp) {
+    return (cp >= 0x2190 && cp <= 0x21FF) ||  // arrows
+           (cp >= 0x2300 && cp <= 0x23FF) ||  // technical (hourglass, etc.)
+           (cp >= 0x25A0 && cp <= 0x25FF) ||  // geometric shapes
+           (cp >= 0x2600 && cp <= 0x27BF) ||  // misc symbols / dingbats
+           (cp >= 0x2B00 && cp <= 0x2BFF) ||  // misc symbols and arrows
+           (cp >= 0x1F000 && cp <= 0x1FAFF) ||  // emoji, pictographs
+           (cp == 0xFE0F) || (cp == 0xFE0E) ||  // variation selectors
+           (cp == 0x200D) || (cp == 0x20E3);    // ZWJ, combining keycap
+}
+
 std::string sanitize_for_speech(const std::string& in) {
     std::string out;
     out.reserve(in.size());
     bool space = false;
-    for (char c : in) {
-        if (c == '"' || c == '\'' || c == '`' || c == '*' || c == '#' ||
-            c == '_' || c == '\n' || c == '\r' || c == '\t') {
-            space = true;
-            continue;
+    for (size_t i = 0; i < in.size();) {
+        const unsigned char c = (unsigned char)in[i];
+        // Decode one UTF-8 sequence; malformed bytes are dropped as noise.
+        uint32_t cp = c;
+        size_t len = 1;
+        if (c >= 0x80) {
+            len = (c >= 0xF0) ? 4 : (c >= 0xE0) ? 3 : (c >= 0xC0) ? 2 : 0;
+            if (len == 0 || i + len > in.size()) {
+                ++i;
+                space = true;
+                continue;
+            }
+            cp = (uint32_t)(c & (0xFF >> (len + 1)));
+            for (size_t k = 1; k < len; ++k)
+                cp = (cp << 6) | (uint32_t)((unsigned char)in[i + k] & 0x3F);
         }
-        if (std::isspace((unsigned char)c)) {
+        i += len;
+
+        if (c < 0x80) {
+            if (c == '"' || c == '\'' || c == '`' || c == '*' || c == '#' ||
+                c == '_' || c == '\n' || c == '\r' || c == '\t') {
+                space = true;
+                continue;
+            }
+            if (std::isspace(c)) {
+                space = true;
+                continue;
+            }
+        } else if (is_symbol_codepoint(cp)) {
             space = true;
             continue;
         }
         if (space && !out.empty()) out += ' ';
         space = false;
-        out += c;
+        out.append(in, i - len, len);
     }
     return out;
 }
@@ -108,6 +145,55 @@ std::string trim(const std::string& s) {
     while (a < b && std::isspace((unsigned char)s[a])) ++a;
     while (b > a && std::isspace((unsigned char)s[b - 1])) --b;
     return s.substr(a, b - a);
+}
+
+// "No repeats within a session" is compared on lowercase words only, so
+// "One moment." and "one moment" are the same phrase.
+std::string normalize_phrase(const std::string& s) {
+    std::string out;
+    bool space = false;
+    for (char c : s) {
+        const unsigned char u = (unsigned char)c;
+        if (std::isalnum(u)) {
+            if (space && !out.empty()) out += ' ';
+            space = false;
+            out += (char)std::tolower(u);
+        } else {
+            space = true;
+        }
+    }
+    return out;
+}
+
+// A filler that cannot be spoken is rejected and replaced by the bank. Digits
+// are the mechanical proxy for "claims a result": "the door is 1" is never a
+// holding phrase.
+bool plausible_filler(const std::string& text) {
+    const std::string t = trim(text);
+    if (t.empty()) return false;
+    if (word_count(t) > 40) return false;
+    for (char c : t) {
+        if (std::isdigit((unsigned char)c)) return false;
+    }
+    return !normalize_phrase(t).empty();
+}
+
+// Filler policy constants. They are deliberately conservative: the bridge only
+// has to cover a gap, not fill the whole wait. A bank phrase lasts 0.7-1.3 s at
+// kMsPerWord, so one estimate plus a short phrase accumulates ~1.5 s of speech.
+constexpr int64_t kFillerEstimateMs = 1500;
+// Head start the answer needs after the task result (LLM TTFT + TTS TTFA).
+constexpr int64_t kResultReserveMs = 500;
+// Bound on retries when the LLM produces an unusable filler.
+constexpr int kMaxLlmFillerAttempts = 3;
+constexpr size_t kMaxSpokenFillersRemembered = 64;
+// Spoken-duration estimate, measured on the real engines (~325 ms/word for the
+// qwen3-tts clone voice). Used as the filler budget: committed speech minus
+// playback elapsed.
+constexpr int64_t kMsPerWord = 325;
+
+int64_t estimate_speech_ms(const std::string& s) {
+    return (int64_t)word_count(s) * kMsPerWord;
 }
 
 }  // namespace
@@ -151,6 +237,13 @@ void SpeechSequencer::on_speech_start(int64_t t_ms) {
     state_ = TurnState::Listening;
     speech_start_ms_ = t_ms;
     speech_end_ms_ = 0;
+    task_deadline_ms_ = 0;
+    llm_fillers_outstanding_ = 0;
+    llm_filler_empty_streak_ = 0;
+    llm_filler_speakable_ = 0;
+    speech_committed_ms_ = 0;
+    play_origin_ms_ = -1;
+    played_since_origin_ms_ = 0;
     transcript_.clear();
     stable_transcript_.clear();
     task_text_.clear();
@@ -193,6 +286,10 @@ void SpeechSequencer::on_final(const std::string& text, int64_t t_ms) {
     state_ = TurnState::Delegating;
     task_pending_ = true;
     metrics_.task_dispatch_ms = t_ms;
+    // Expected arrival of the result. The adapter jitters by +/-task_jitter_ms;
+    // the centre is used on purpose: over-covering costs a filler of answer
+    // delay, under-covering is dead air, and dead air is the failure mode.
+    task_deadline_ms_ = t_ms + cfg_.task_ms;
     // The orchestrator dispatches the task when it sees this request; the ack
     // is generated immediately and in parallel.
     emit_request(TextKind::Ack,
@@ -242,6 +339,7 @@ void SpeechSequencer::on_text_delta(TextKind kind, const std::string& piece,
     if (!generation_active_[idx]) {
         generation_active_[idx] = true;
         ++metrics_.llm_calls;
+        if (kind == TextKind::Filler) llm_filler_speakable_ = 0;
         if (kind == TextKind::Ack) metrics_.ack_text_ms = t_ms;
         if (kind == TextKind::Answer) {
             metrics_.answer_text_ms = t_ms;
@@ -256,6 +354,25 @@ void SpeechSequencer::on_text_done(TextKind kind, int64_t t_ms) {
     generation_active_[(int)kind] = false;
     if (kind == TextKind::Answer) answer_requested_ = false;
     feed_text(kind, std::string(), t_ms, true);
+    if (kind != TextKind::Filler) return;
+
+    // The generation is over whichever way it went: never leave the queue
+    // counter stuck, or the bridge stops asking for filler for the rest of the
+    // turn.
+    if (llm_fillers_outstanding_ > 0) --llm_fillers_outstanding_;
+    if (llm_filler_speakable_ > 0) {
+        llm_filler_empty_streak_ = 0;
+        return;
+    }
+
+    // Empty, unspoken, or a rejected repeat: the bridge must not stall. The bank
+    // is the safety net in every mode (that is what a pre-written bank is for);
+    // only if it is exhausted does a retry make sense, and only a bounded one.
+    ++stats_.fillers_llm_empty;
+    ++llm_filler_empty_streak_;
+    if (queue_bank_filler(t_ms)) return;
+    if (llm_filler_empty_streak_ < kMaxLlmFillerAttempts)
+        maybe_request_filler("retry", t_ms);
 }
 
 void SpeechSequencer::feed_text(TextKind kind, const std::string& piece,
@@ -280,26 +397,52 @@ void SpeechSequencer::feed_text(TextKind kind, const std::string& piece,
                 break;
             }
             ack_words_ += word_count(clause);
+            speech_committed_ms_ += estimate_speech_ms(clause);
+        }
+        if (kind == TextKind::Filler) {
+            // A filler that arrives after the result is in is stale speech: the
+            // answer owns the floor from here on.
+            if (task_done_) {
+                ++stats_.fillers_dropped_stale;
+                continue;
+            }
+            if (!accept_filler_text(clause)) continue;
+            ++llm_filler_speakable_;
         }
         TextSegment s;
         s.kind = kind;
         s.text = sanitize_for_speech(trim(clause));
         s.seq = (uint64_t)clauses_.size() + 1;
         s.created_ms = t_ms;
-        if (kind == TextKind::Filler) s.expire_ms = t_ms + 4000;
+        if (kind == TextKind::Filler) {
+            s.expire_ms = t_ms + 4000;
+            ++stats_.fillers_queued;
+            speech_committed_ms_ += estimate_speech_ms(clause);
+        }
         clauses_.push_back(std::move(s));
     }
     if (done) {
         std::string rest = sanitize_for_speech(trim(pending_[(int)kind]));
         pending_[(int)kind].clear();
-        if (!rest.empty() && word_count(rest) > 0) {
+        const bool usable =
+            !rest.empty() && word_count(rest) > 0 &&
+            (kind != TextKind::Filler ||
+             (!task_done_ && accept_filler_text(rest)));
+        if (usable) {
             TextSegment s;
             s.kind = kind;
             s.text = rest;
             s.seq = (uint64_t)clauses_.size() + 1;
             s.created_ms = t_ms;
-            if (kind == TextKind::Filler) s.expire_ms = t_ms + 4000;
+            if (kind == TextKind::Filler) {
+                s.expire_ms = t_ms + 4000;
+                ++llm_filler_speakable_;
+                ++stats_.fillers_queued;
+                speech_committed_ms_ += estimate_speech_ms(rest);
+            }
             clauses_.push_back(std::move(s));
+        } else if (kind == TextKind::Filler && task_done_) {
+            ++stats_.fillers_dropped_stale;
         }
     }
     request_next_clause(t_ms);
@@ -343,45 +486,155 @@ void SpeechSequencer::request_next_clause(int64_t t_ms) {
 void SpeechSequencer::maybe_request_filler(const std::string& reason,
                                            int64_t t_ms) {
     (void)reason;
-    if (cfg_.filler_mode == Config::FillerMode::Bank ||
-        cfg_.filler_mode == Config::FillerMode::BankThenLlm) {
-        if (spoken_bank_.size() >= (size_t)kFillerCount) {
-            // Bank exhausted in this session: fall through to the LLM only if
-            // the mode allows it, otherwise stay silent.
-            if (cfg_.filler_mode == Config::FillerMode::Bank) return;
-        } else {
-            TextSegment s;
-            s.kind = TextKind::Filler;
-            s.text = next_bank_filler();
-            s.seq = 0;
-            s.created_ms = t_ms;
-            s.expire_ms = t_ms + 4000;
-            clauses_.push_back(std::move(s));
-            request_next_clause(t_ms);
+    if (!turn_active()) return;
+    if (answer_buffered_) return;  // the answer's PCM exists: stop bridging
+    if (task_done_ && !answer_requested_) return;
+    // At most two filler generations outstanding, the same depth as the clause
+    // queue. One is not enough for the LLM mode: each filler costs a generation
+    // plus a TTS TTFA, so a single slot leaves the ring dry between phrases.
+    // Unbounded is worse: a request on every low-water tick queued a pile of
+    // fillers whose audio then played ahead of the answer it was covering.
+    if (llm_fillers_outstanding_ >= 2) return;
+    // Two regimes, both needed:
+    //  - comfortable buffer: bridge only while the committed speech is short of
+    //    the expected result (+reserve for the answer's TTFT/TTFA). Filler
+    //    plays ahead of the answer and cannot be retracted, so a deep pile of
+    //    it is exactly what delays the answer it was covering.
+    //  - buffer below low_water: always bridge. This is the watermark's stated
+    //    meaning ("below this, TTS has priority and filler is requested"), and
+    //    it is what covers a task result that arrives earlier than expected,
+    //    which any deadline prediction gets wrong half the time.
+    if (task_deadline_ms_ > 0 && buffer_ms_ >= cfg_.low_water_ms) {
+        const int64_t until_result = task_deadline_ms_ - t_ms;
+        if (until_result > -kResultReserveMs &&
+            remaining_speech_ms() >= until_result + kResultReserveMs)
             return;
-        }
     }
+
+    // Bank first when the mode has one; a bank phrase costs no generation.
+    if (cfg_.filler_mode != Config::FillerMode::Llm) {
+        if (queue_bank_filler(t_ms)) return;
+        if (cfg_.filler_mode == Config::FillerMode::Bank) return;  // stay silent
+    }
+
+    // A generation that keeps producing nothing usable must not turn into a
+    // request loop; three empty results in a row retire the LLM filler for this
+    // turn and leave the bank (if any) as the bridge.
+    if (llm_filler_empty_streak_ >= kMaxLlmFillerAttempts) return;
+    ++llm_fillers_outstanding_;
+    llm_filler_speakable_ = 0;
+    const std::string said = recent_fillers_for_prompt();
     emit_request(TextKind::Filler,
                  "The user is waiting. You are still checking \"" + transcript_ +
                      "\". Say one short, natural holding phrase that does not "
                      "claim progress or a result, and does not repeat what you "
                      "already said" +
-                     (spoken_context_.empty()
-                          ? std::string(".")
-                          : ": \"" + spoken_context_ + "\"."));
+                     (said.empty() ? std::string(".")
+                                   : ": \"" + said + "\"."));
 }
 
-std::string SpeechSequencer::next_bank_filler() {
-    if (bank_cursor_ >= kFillerCount) bank_cursor_ = 0;
-    const std::string s = kFillerBank[bank_cursor_++ % kFillerCount];
-    spoken_bank_.push_back(s);
-    return s;
+bool SpeechSequencer::queue_bank_filler(int64_t t_ms) {
+    // Close to the expected result, take the shortest unused phrase: the bridge
+    // lands on the answer more accurately when the last piece is ~0.6 s instead
+    // of ~1.5 s, and a long last filler is what delays the answer.
+    const bool near_result =
+        task_deadline_ms_ > 0 && task_deadline_ms_ - t_ms < 2 * kFillerEstimateMs;
+    std::string text = next_bank_filler(near_result);
+    while (!text.empty()) {
+        if (accept_filler_text(text)) {
+            TextSegment s;
+            s.kind = TextKind::Filler;
+            s.text = sanitize_for_speech(text);
+            s.seq = 0;
+            s.created_ms = t_ms;
+            s.expire_ms = t_ms + 4000;
+            ++stats_.fillers_queued;
+            speech_committed_ms_ += estimate_speech_ms(s.text);
+            clauses_.push_back(std::move(s));
+            request_next_clause(t_ms);
+            return true;
+        }
+        // A bank phrase the LLM already used this session: try the next one.
+        text = next_bank_filler(near_result);
+    }
+    return false;
+}
+
+// Speech still ahead of the playback position, from what this turn has already
+// committed (word-based estimate minus what the sink has actually played).
+int64_t SpeechSequencer::remaining_speech_ms() const {
+    return std::max<int64_t>(0, speech_committed_ms_ - played_since_origin_ms_);
+}
+
+bool SpeechSequencer::accept_filler_text(const std::string& text) {
+    const std::string clean = sanitize_for_speech(trim(text));
+    if (!plausible_filler(clean)) {
+        ++stats_.fillers_repeat_rejected;  // unusable counts as rejected speech
+        return false;
+    }
+    const std::string norm = normalize_phrase(clean);
+    for (const std::string& said : spoken_fillers_) {
+        if (normalize_phrase(said) == norm) {
+            ++stats_.fillers_repeat_rejected;
+            return false;
+        }
+    }
+    for (const TextSegment& s : clauses_) {
+        if (s.kind == TextKind::Filler && normalize_phrase(s.text) == norm) {
+            ++stats_.fillers_repeat_rejected;
+            return false;
+        }
+    }
+    spoken_fillers_.push_back(clean);
+    while (spoken_fillers_.size() > kMaxSpokenFillersRemembered)
+        spoken_fillers_.pop_front();
+    return true;
+}
+
+std::string SpeechSequencer::recent_fillers_for_prompt() const {
+    std::string out;
+    size_t n = spoken_fillers_.size();
+    size_t start = n > 6 ? n - 6 : 0;
+    for (size_t i = start; i < n; ++i) {
+        if (!out.empty()) out += " ";
+        out += spoken_fillers_[i];
+    }
+    return out;
+}
+
+std::string SpeechSequencer::next_bank_filler(bool shortest_first) {
+    // Never repeat a bank phrase: walk the ring buffer and skip anything this
+    // session already used. Returns "" when the bank is exhausted.
+    int best = -1;
+    for (int i = 0; i < kFillerCount; ++i) {
+        const int idx = (bank_cursor_ + i) % kFillerCount;
+        const std::string cand = kFillerBank[idx];
+        if (std::find(spoken_bank_.begin(), spoken_bank_.end(), cand) !=
+            spoken_bank_.end())
+            continue;
+        if (!shortest_first) {
+            best = idx;
+            break;
+        }
+        if (best < 0 || word_count(cand) < word_count(kFillerBank[best])) best = idx;
+    }
+    if (best < 0) return std::string();
+    bank_cursor_ = (best + 1) % kFillerCount;
+    spoken_bank_.push_back(kFillerBank[best]);
+    return kFillerBank[best];
 }
 
 void SpeechSequencer::on_playback(int64_t buffer_ms, int64_t played_ms,
                                   int64_t t_ms) {
     buffer_ms_ = buffer_ms;
     played_ms_ = played_ms;
+    // Playback clock for the filler budget. The origin is the moment the ack
+    // started playing (played_ms counts from the start of the run, not the
+    // turn), so "committed speech minus elapsed" is the speech still to come.
+    if (metrics_.ack_first_played_ms > 0) {
+        if (play_origin_ms_ < 0) play_origin_ms_ = played_ms;
+        played_since_origin_ms_ = std::max<int64_t>(0, played_ms - play_origin_ms_);
+    }
 
     // The answer's PCM existing is the signal, not a full target buffer: a
     // short answer may never fill target_water_ms, and waiting for it kept
@@ -486,6 +739,8 @@ void SpeechSequencer::flush_text() {
     clauses_.clear();
     answer_text_ms_ = 0;
     answer_buffered_ = false;
+    llm_fillers_outstanding_ = 0;
+    task_deadline_ms_ = 0;
 }
 
 void SpeechSequencer::on_pcm_enqueued(int n_samples, int64_t t_ms) {

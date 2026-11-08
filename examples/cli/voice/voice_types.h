@@ -69,6 +69,7 @@ struct Config {
     std::string tts_tokenizer;
     std::string tts_voice_dir;
     std::string tts_voice = "jarvis";
+    std::string language = "en";   // TTS target language (en|es); ASR stays auto
     std::string chat_model;
     int chat_gpu_layers = 99;
     int chat_ctx = 2048;

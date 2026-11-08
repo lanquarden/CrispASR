@@ -34,6 +34,8 @@ struct Action {
 struct SequencerStats {
     int fillers_queued = 0;
     int fillers_dropped_stale = 0;
+    int fillers_repeat_rejected = 0;
+    int fillers_llm_empty = 0;
     int stale_results_dropped = 0;
     int clauses_spoken = 0;
     int barge_ins = 0;
@@ -64,6 +66,11 @@ class SpeechSequencer {
     const std::string& transcript() const { return transcript_; }
     const std::string& spoken_filler_context() const { return spoken_context_; }
 
+    // Diagnostics for the filler policy itself (not part of the metrics
+    // contract): the sweep reads them to explain a thin bridge.
+    int filler_repeats_rejected() const { return stats_.fillers_repeat_rejected; }
+    int filler_llm_empty() const { return stats_.fillers_llm_empty; }
+
     // --- outputs ----------------------------------------------------------
     // Drain actions produced since the last call. Order is significant.
     std::vector<Action> take_actions();
@@ -80,7 +87,11 @@ class SpeechSequencer {
     void flush_text();
     void maybe_request_filler(const std::string& reason, int64_t t_ms);
     void request_next_clause(int64_t t_ms);
-    std::string next_bank_filler();
+    std::string next_bank_filler(bool shortest_first);
+    bool queue_bank_filler(int64_t t_ms);
+    bool accept_filler_text(const std::string& text);
+    std::string recent_fillers_for_prompt() const;
+    int64_t remaining_speech_ms() const;
     void end_turn(int64_t t_ms);
     bool text_stale(const TextSegment& s, int64_t t_ms) const;
 
@@ -107,9 +118,21 @@ class SpeechSequencer {
 
     // filler state
     int bank_cursor_ = 0;
-    std::deque<std::string> spoken_bank_;   // no repeats within a session
-    bool filler_in_flight_ = false;
+    std::deque<std::string> spoken_bank_;   // bank phrases used this session
+    // Every filler (bank or LLM) spoken this session, in original wording. The
+    // policy is "never repeat within a session", so this outlives the turn; it
+    // is capped and only ever searched linearly (a voice session is short).
+    std::deque<std::string> spoken_fillers_;
+    int llm_fillers_outstanding_ = 0;  // filler generations queued/in flight
+    int llm_filler_empty_streak_ = 0;  // this turn; bounds a hot retry loop
+    int llm_filler_speakable_ = 0;   // clauses this generation actually queued
+    int64_t task_deadline_ms_ = 0;   // dispatch + task_ms + jitter (upper bound)
     int64_t last_filler_ms_ = 0;
+    // Speech this turn has committed (ack + filler), from a word estimate, and
+    // how much of it has actually been played since the ack started.
+    int64_t speech_committed_ms_ = 0;
+    int64_t play_origin_ms_ = -1;
+    int64_t played_since_origin_ms_ = 0;
 
     // playback view
     int64_t buffer_ms_ = 0;

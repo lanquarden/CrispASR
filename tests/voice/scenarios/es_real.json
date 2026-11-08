@@ -1,0 +1,13 @@
+{
+  "name": "es_real",
+  "input": "question_es_real.wav",
+  "task_ms": 6000,
+  "runs": 2,
+  "warmup": 1,
+  "expect": {
+    "max_gap_ms": 300,
+    "min_filler_played": 1,
+    "answer_played": true
+  },
+  "language": "es"
+}

@@ -1,0 +1,12 @@
+{
+  "name": "barge_real",
+  "input": "question_real.wav",
+  "task_ms": 6000,
+  "runs": 2,
+  "warmup": 1,
+  "barge_in_at_ms": 4000,
+  "expect": {
+    "barge_in_detected": true,
+    "barge_in_stop_ms": 250
+  }
+}

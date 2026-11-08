@@ -26,6 +26,7 @@
 #include "sequencer.h"
 #include "stt_driver.h"
 #include "task_adapter.h"
+#include "tool_call.h"
 #include "turn_detector.h"
 
 namespace crispasr {
@@ -123,6 +124,7 @@ std::map<std::string, std::vector<float>> prerender_fillers(TtsEngine* tts,
 
 constexpr int64_t kLlmDone = 100;  // + kind
 constexpr int64_t kTtsDone = 200;
+constexpr int64_t kToolDone = 300;  // tool decision finished; text = raw reply
 
 // Timeline.csv cadence for the playback ring rows.
 constexpr int64_t kPlaybackTraceMs = 100;
@@ -135,6 +137,15 @@ struct PendingText {
     int64_t request_ms = 0;  // absolute steady_ms when the action ran
     int turn = 0;
     int64_t base_ms = 0;     // absolute speech_start of that turn
+};
+
+// A queued tool decision for one turn. The transcript is the model's only
+// input and also the fallback task request, so it travels with the item.
+struct PendingTool {
+    std::string transcript;
+    int64_t request_ms = 0;
+    int turn = 0;
+    int64_t base_ms = 0;
 };
 
 // A queued TTS piece: same idea. TextSegment alone cannot carry the base.
@@ -212,8 +223,12 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
                           cfg.vad_energy_threshold);
     InferenceArbiter arbiter;
     arbiter.start();
-    SimulatedTaskAdapter task(cfg.task_ms, cfg.task_jitter_ms,
-                              cfg.task_fail_percent);
+    // One dispatcher per run: the tool decides the task's latency/failure
+    // profile, not the loop. VOICE_TOOL_MODE (or --tool-mode) picks where the
+    // decision comes from; see tool_call.h.
+    ToolDispatcher tools(cfg);
+    const ToolMode tool_mode = tool_mode_from_env();
+    std::fprintf(stderr, "[tool] mode=%s\n", to_string(tool_mode));
 
     EventQueue events;
     AudioLedger ledger;
@@ -230,7 +245,11 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
     const int64_t t0 = steady_ms();
     int64_t first_played_ack = 0, first_played_answer = 0;
     std::string ack_buf, answer_buf;
+    bool answer_pcm_dropped_fillers = false;
     int64_t current_task_id = 0;
+    // Incremented per dispatch; the task callback drops outcomes from an older
+    // generation (see dispatch_task).
+    std::atomic<uint64_t> task_generation{0};
     std::atomic<uint64_t> epoch{0};
     std::atomic<int> work_in_flight{0};
     struct WorkGuard {
@@ -249,11 +268,20 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
         });
     });
 
-    auto dispatch_task = [&](const std::string& transcript) {
+    auto dispatch_task = [&](const ToolCall& call, const std::string& transcript) {
         const uint64_t my_epoch = epoch.load();
-        current_task_id =
-            task.dispatch(transcript, [&, my_epoch](const TaskOutcome& o) {
+        // seq.on_final() stamps task_dispatch_ms speculatively; restamp it with
+        // the real start (a corrective dispatch moves it too).
+        seq.metrics().task_dispatch_ms = steady_ms();
+        // Generation guard: a task superseded by a corrective dispatch must not
+        // deliver its outcome (a cancelled device check would otherwise be
+        // spoken as a task failure). The counter is published before dispatch,
+        // so a zero-latency task cannot race its own start either.
+        const uint64_t gen = task_generation.fetch_add(1) + 1;
+        const int id = tools.dispatch(
+            call, transcript, [&, my_epoch, gen](const TaskOutcome& o) {
                 if (my_epoch != epoch.load()) return;
+                if (gen != task_generation.load()) return;  // superseded
                 Event e;
                 e.type = o.cancelled
                              ? EventType::TaskFailed
@@ -262,6 +290,10 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
                 e.t_ms = steady_ms();
                 events.post(std::move(e));
             });
+        current_task_id = id;
+        if (std::getenv("VOICE_DEBUG"))
+            std::fprintf(stderr, "[dbg] dispatch tool=%s id=%d gen=%llu\n",
+                         to_string(call.tool), id, (unsigned long long)gen);
     };
 
     // ---- LLM: one generation at a time, FIFO --------------------------------
@@ -269,6 +301,8 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
     std::deque<PendingText> llm_pending;
     std::atomic<bool> llm_busy{false};
 
+    const std::string lang_rule =
+        cfg.language == "es" ? " Responde siempre en español." : std::string();
     std::function<void()> pump_llm = [&] {
         PendingText item;
         {
@@ -293,16 +327,17 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
                     "person, at most eight words. Acknowledge what was asked and say "
                     "you are checking. Never mention \"the user\" or restate the "
                     "request in the third person. No quotation marks, no markdown. "
-                    "Never state a result you do not have.";
+                    "Never state a result you do not have." + lang_rule;
             } else if (kind == TextKind::Filler) {
                 sys.content =
                     "You are a voice assistant. Say one short, natural holding "
                     "phrase. Do not claim progress or a result. Do not repeat "
-                    "yourself.";
+                    "yourself." + lang_rule;
             } else {
                 sys.content =
                     "You are a voice assistant. Answer in one or two short spoken "
-                    "sentences, continuing naturally from what you already said.";
+                    "sentences, continuing naturally from what you already said. "
+                    "No quotation marks, no markdown." + lang_rule;
             }
             ChatMessage user;
             user.role = "user";
@@ -364,6 +399,81 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
             done.aux2 = first_token > 0 ? first_token - started : 0;
             done.aux3 = (int64_t)kind;
             done.t_ms = steady_ms();
+            events.post(std::move(done));
+        });
+    };
+
+    // ---- tool decision: one per turn, queued *behind* the ack --------------─
+    // Same arbiter, same chat session: the ack generation is already queued
+    // when this runs, so the spoken ack never waits for the decision. The job
+    // posts its parsed call back to the control thread; only that thread owns
+    // the task id and the metrics.
+    std::mutex tool_mu;
+    std::deque<PendingTool> tool_pending;
+    std::atomic<bool> tool_busy{false};
+
+    std::function<void()> pump_tool = [&] {
+        PendingTool item;
+        {
+            std::lock_guard<std::mutex> lk(tool_mu);
+            if (tool_busy.load() || tool_pending.empty()) return;
+            tool_busy = true;
+            item = tool_pending.front();
+            tool_pending.pop_front();
+        }
+        const uint64_t my_epoch = epoch.load();
+        work_in_flight.fetch_add(1);
+        arbiter.post(Priority::Llm, "tool", [&, item, my_epoch] {
+            WorkGuard wg(work_in_flight);
+            const int64_t started = steady_ms();
+            int64_t first_token = 0;
+            int tokens = 0;
+            std::string raw;
+            if (tool_mode == ToolMode::Llm) {
+                const std::vector<ChatMessage> msgs = tool_call_messages(item.transcript);
+                TokenCallback on_token = [&](const std::string& piece) {
+                    if (my_epoch != epoch.load()) return false;
+                    if (first_token == 0) first_token = steady_ms();
+                    ++tokens;
+                    raw += piece;
+                    return true;
+                };
+                engines.llm->generate(msgs, kToolCallMaxTokens, on_token,
+                                      std::string());
+            } else {
+                // Harness override: deterministic reply, no model call, same
+                // parsing and dispatch path as the real thing.
+                raw = fake_tool_reply(tool_mode, item.transcript);
+            }
+            const int64_t finished = steady_ms();
+            {
+                std::lock_guard<std::mutex> lk(tool_mu);
+                tool_busy = false;
+            }
+            const ToolCall call = parse_tool_call(raw);
+            // One timeline row per decision: which tool the model picked and
+            // the reply it picked it from, on the same base as metrics.jsonl.
+            {
+                TimelineRow row;
+                row.turn = item.turn;
+                row.stage = "tool";
+                row.kind = to_string(call.tool);
+                row.text = raw;
+                row.t_request_ms = item.base_ms > 0 ? item.request_ms - item.base_ms : -1;
+                row.t_job_start_ms = item.base_ms > 0 ? started - item.base_ms : -1;
+                row.t_done_ms = item.base_ms > 0 ? finished - item.base_ms : -1;
+                row.samples = (tool_mode == ToolMode::Llm) ? tokens
+                                                           : (int64_t)raw.size();
+                timeline_trace().add(std::move(row));
+            }
+            if (my_epoch != epoch.load()) return;  // turn flushed: no dispatch
+            Event done;
+            done.type = EventType::Tick;
+            done.aux = kToolDone;
+            done.aux2 = call.valid ? 1 : 0;
+            done.aux3 = (int64_t)call.tool;
+            done.text = raw;
+            done.t_ms = finished;
             events.post(std::move(done));
         });
     };
@@ -452,6 +562,11 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
         });
     };
 
+    // Set on a final transcript, consumed after the sequencer's actions run so
+    // the ack request is always ahead of the decision in the LLM queue.
+    bool tool_request_pending = false;
+    std::string tool_request_transcript;
+
     auto execute = [&](std::vector<Action>& actions) {
         for (Action& a : actions) {
             switch (a.type) {
@@ -506,13 +621,19 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
                         llm_pending.clear();
                         llm_busy = false;
                     }
+                    {
+                        std::lock_guard<std::mutex> lk(tool_mu);
+                        tool_pending.clear();
+                        tool_busy = false;
+                    }
+                    tool_request_pending = false;
                     engines.llm->request_abort();
                     seq.metrics().barge_in_stop_ms =
                         std::max<int64_t>(0, steady_ms() - a.arg);
                     break;
                 }
                 case ActionType::CancelTask:
-                    if (current_task_id > 0) task.cancel(current_task_id);
+                    if (current_task_id > 0) tools.cancel(current_task_id);
                     break;
                 case ActionType::FinishTurn: {
                     TurnMetrics m = seq.metrics();
@@ -693,7 +814,34 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
                     seq.metrics().stt_final_cost_ms = e.aux2;
                     seq.metrics().transcript = e.text;
                     seq.on_final(e.text, e.t_ms);
-                    if (!e.text.empty()) dispatch_task(e.text);
+                    if (!e.text.empty()) {
+                        if (tool_mode == ToolMode::Off) {
+                            // Pre-M2 behaviour, kept as the regression baseline.
+                            ToolCall legacy;
+                            legacy.tool = ToolId::DeviceStatus;
+                            legacy.device = "garage";
+                            legacy.reason = "tool_mode=off";
+                            dispatch_task(legacy, e.text);
+                        } else {
+                            // Speculative dispatch: start the common device check
+                            // now (the pre-M2 instant) and let the decision
+                            // cancel it only when it chose something else. The
+                            // alternative — waiting ~150 ms for the JSON —
+                            // shifts the whole turn and widens the pre-answer
+                            // gap, because the sequencer's filler reserve is
+                            // anchored to the final transcript.
+                            ToolCall spec;
+                            spec.tool = ToolId::DeviceStatus;
+                            spec.device = "garage";
+                            spec.reason = "speculative";
+                            dispatch_task(spec, e.text);
+                            tool_request_transcript = e.text;
+                            tool_request_pending = true;
+                            // Counted now, not at completion: an attempt whose
+                            // turn is flushed mid-generation still happened.
+                            ++seq.metrics().tool_calls;
+                        }
+                    }
                     break;
                 case EventType::BargeIn:
                     seq.on_barge_in(e.t_ms);
@@ -708,7 +856,51 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
                     seq.on_starved(e.t_ms, e.aux);
                     break;
                 case EventType::Tick:
-                    if (e.aux >= kLlmDone && e.aux < kLlmDone + 4) {
+                    if (e.aux == kToolDone) {
+                        // The event carries the raw reply; the parse is
+                        // deterministic, so re-parse instead of shipping two
+                        // encodings through one Event.
+                        const ToolCall call = parse_tool_call(e.text);
+                        // A speculative device_status(garage) is already
+                        // running (see FinalTranscript). Only a disagreement
+                        // costs a cancel + re-dispatch.
+                        const bool agrees = call.valid &&
+                                            call.tool == ToolId::DeviceStatus &&
+                                            call.device == "garage";
+                        ToolCall chosen = call;
+                        const char* action = "kept";
+                        if (call.valid) {
+                            ++seq.metrics().tool_calls_valid;
+                            if (!agrees) {
+                                if (current_task_id > 0) tools.cancel(current_task_id);
+                                action = "redispatch";
+                                dispatch_task(chosen, seq.metrics().transcript);
+                            }
+                        } else {
+                            // Unusable reply: keep the speculative device check
+                            // and use the transcript as the request.
+                            chosen.tool = ToolId::DeviceStatus;
+                            chosen.device = "garage";
+                            chosen.minutes = 0;
+                            chosen.valid = false;
+                            chosen.reason = "fallback (" + call.reason + ")";
+                            action = "fallback";
+                        }
+                        std::string flat = e.text;
+                        for (char& c : flat)
+                            if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+                        const std::string args =
+                            (chosen.device.empty() ? std::string() : chosen.device) +
+                            (chosen.minutes > 0
+                                 ? " minutes=" + std::to_string(chosen.minutes)
+                                 : std::string());
+                        std::fprintf(stderr,
+                                     "[tool] mode=%s valid=%d tool=%s args=[%s] "
+                                     "action=%s reason='%s' raw='%s'\n",
+                                     to_string(tool_mode), (int)call.valid,
+                                     to_string(chosen.tool), args.c_str(), action,
+                                     call.reason.c_str(), flat.c_str());
+                    } else if (e.aux >= kLlmDone && e.aux < kLlmDone + 4) {
                         seq.metrics().llm_ttft_ms = std::max(
                             seq.metrics().llm_ttft_ms, e.aux2);
                         if ((TextKind)e.aux3 == TextKind::Ack)
@@ -743,10 +935,25 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
         std::vector<Action> actions = seq.take_actions();
         if (!actions.empty()) execute(actions);
 
+        // The ack (or clarify) request is in the LLM queue by now.
+        if (tool_request_pending) {
+            tool_request_pending = false;
+            PendingTool item;
+            item.transcript = tool_request_transcript;
+            item.request_ms = steady_ms();
+            item.turn = seq.turn_id();
+            item.base_ms = seq.metrics().speech_start_ms;
+            {
+                std::lock_guard<std::mutex> lk(tool_mu);
+                tool_pending.push_back(std::move(item));
+            }
+            pump_tool();
+        }
+
         // Decide after draining events and executing their actions: a finished
         // ASR job may have queued the final transcript this very iteration.
         if (at_eof && seq.state() == TurnState::Idle && ring.available() == 0 &&
-            !tts_busy && !llm_busy && work_in_flight.load() == 0)
+            !tts_busy && !llm_busy && !tool_busy && work_in_flight.load() == 0)
             break;
 
         if (now - last_tick_ms >= 20) {
@@ -817,7 +1024,7 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
     sink.stop();
     playback.join();
     writer.finish();
-    task.shutdown();
+    tools.shutdown();
     arbiter.stop();
 
     // Harness mode owns the file (it truncates once per invocation and appends

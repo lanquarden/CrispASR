@@ -177,6 +177,7 @@ struct Scenario {
     int runs = 3;
     int warmup = 1;
     int task_ms = -1;
+    std::string language;
     int task_fail_percent = -1;
     int barge_in_at_ms = -1;
     bool has_transcript = false;
@@ -229,6 +230,7 @@ bool load_scenario(const std::string& path, Scenario* sc, std::string* err) {
         else if (key == "runs") sc->runs = to_int(val, sc->runs);
         else if (key == "warmup" || key == "warmup_runs") sc->warmup = to_int(val, sc->warmup);
         else if (key == "task_ms") sc->task_ms = to_int(val, sc->task_ms);
+        else if (key == "language") sc->language = val;
         else if (key == "task_fail_percent") {
             sc->task_fail_percent = to_int(val, sc->task_fail_percent);
         } else if (key == "barge_in_at_ms") {
@@ -455,6 +457,7 @@ int run_harness(const Config& cfg_in, const std::string& scenario_path) {
     if (!extras.runs_set) cfg.runs = sc.runs;
     if (!extras.warmup_set) cfg.warmup_runs = sc.warmup;
     if (!extras.task_ms_set && sc.task_ms >= 0) cfg.task_ms = sc.task_ms;
+    if (!sc.language.empty()) cfg.language = sc.language;
     if (sc.task_fail_percent >= 0) cfg.task_fail_percent = sc.task_fail_percent;
     if (cfg.runs <= 0) cfg.runs = 1;
     if (cfg.warmup_runs < 0) cfg.warmup_runs = 0;
