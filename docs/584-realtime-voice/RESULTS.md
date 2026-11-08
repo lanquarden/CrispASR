@@ -180,6 +180,30 @@ Port decisions (after adversarial review):
 | duck-don't-mute | drop | no measured echo events; HF ships real AEC3 for a reason |
 | fake clock for scenario tests | adapt | unit tests only; the failing defect is wall-clock native |
 
+## Gap attribution (trace, real engines)
+
+The 360-1090 ms silent runs inside `delegation_real` are **emitted silence, not
+ring starvation**: at t=4.0-5.2 s the playback ring held 2.0-3.0 s of audio while
+the WAV was silent. Per-piece trace shows why: a filler piece is ~1.5 s long but
+only 0.5-1.2 s audible, and the old trim kept only the last 150 ms of tail. The
+remaining work is a stream-level silence gate (keep natural pauses <=220 ms, drop
+the rest), not scheduling.
+
+Piece boundaries are also fewer now: answer/filler text is split at sentence
+boundaries instead of every 6 words, and the answer jumps the TTS queue on task
+result. Worst WAV run: 500 ms -> 360 ms before the gate.
+
+## Testing compared
+
+HF runs 98 pytest modules with fake `perf_counter`, a `RecordingTransport`, a
+`node:vm` audio-worklet simulator, and OpenAI-schema conformance through the
+SDK's own event union — no GPU, no human. We have the same property with a
+different mechanism: deterministic fake engines, a scenario harness, a
+GPU-free `--selftest` (10 policy assertions), and a WAV-derived silence/latency
+check that the loop cannot fake. What we still lack from their playbook: a
+fake-clock mode for unit tests (their tests are instant; ours spend real time),
+and a protocol-conformance test once there is an external protocol to conform to.
+
 ## Measurement bases (found while porting the audible metric)
 
 Two clocks were being mixed:
