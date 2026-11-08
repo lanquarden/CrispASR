@@ -26,7 +26,7 @@ struct Config {
 
     // turn detection
     int vad_min_speech_ms = 250;
-    int vad_min_silence_ms = 150;   // end-of-turn silence (budget-dominant; see RESULTS)
+    int vad_min_silence_ms = 250;   // end-of-turn silence (150 cut mid-sentence; see RESULTS)
     float vad_energy_threshold = 0.006f;  // RMS on 0..1 float PCM
     bool vad_gate_during_playback = true;
 

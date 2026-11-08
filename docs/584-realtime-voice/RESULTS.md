@@ -231,12 +231,20 @@ The pipeline (VAD-declared end -> first audible) is ~250-290 ms. The rest of the
 |---|---|---|
 | 500 ms (old) | 1050 ms | 100 ms |
 | 250 ms | 830 ms | 100 ms |
-| **150 ms (new default)** | **710 ms** | **100 ms** |
+| 150 ms | 710 ms | 100 ms |
+| **250 ms (new default, after review)** | **~830 ms** | **100 ms** |
 | 150 ms, before the silence gate | — | 360 ms |
 
-This mirrors HF's choice (Silero `min_silence_ms=64` plus a smart-turn model);
-we have no smart-turn, so 150 ms is the aggressive end for an energy VAD. Going
+This mirrors HF's choice (Silero `min_silence_ms=64` plus a smart-turn model).
+We tried 150 ms and it passes the fixtures, but a final adversarial review found
+that an energy VAD with no smart-turn can commit a fragment at a 300-500 ms
+inter-phrase pause ("what's the ... weather"). 150 ms is therefore not the
+default: **250 ms** is, which keeps the audible number around 830 ms. Going
 lower is the speculative-ack work (M3), not a tuning exercise.
+
+The silence gate plus the 40 ms speech-confirmation lookahead adds a fixed
+~40 ms before a piece's first emitted sample; that is inside the measured
+audible number, not on top of it.
 
 The 100 ms residual is a quiet span inside the ack plus one piece boundary;
 the gate drops quiet runs >220 ms and keeps natural pauses <=150 ms verbatim.
@@ -252,3 +260,23 @@ short            ok   wav_gap=0ms    audible_p50=920ms
 task_failure     ok   wav_gap=0ms    audible_p50=900ms
 PASS: 6 scenario(s)
 ```
+
+
+## Final review of the gate (glm-5.3-flash)
+
+Verdict was fix-before-ship on two defects, both now fixed:
+
+1. **Hold-cap truncation (HIGH).** With 220 ms of held silence, a following
+   loud-but-unconfirmed onset was appended and then truncated from the end, and
+   `flush()` anchored its 40 ms pad to the front of the hold. A word after an
+   internal pause could be clipped or lost. Fix: per-window loud flags, drop
+   quiet windows from the front at cap (never loud ones), anchor the flush pad
+   to the last loud window.
+2. **Short final onsets (LOW/MEDIUM).** `flush()` now treats a trailing raw-loud
+   run of >=2 windows (20 ms) as confirmed.
+3. **Mid-sentence commits (MEDIUM).** Fixed by restoring the 250 ms default; the
+   review's stronger suggestion (require the partial transcript to match the
+   final before committing) is M3 work.
+4. **Flag clamps (LOW).** `vad_min_speech_ms >= 20`, `vad_min_silence_ms >= 50`.
+5. Comment corrected: the 40 ms confirmation clears `in_run_` on the first quiet
+   window; the lookahead is what defers classification.

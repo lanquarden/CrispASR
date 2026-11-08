@@ -102,8 +102,8 @@ void Config::normalise() {
     if (target_water_ms <= low_water_ms) target_water_ms = low_water_ms + 1;
     if (high_water_ms <= target_water_ms) high_water_ms = target_water_ms + 1;
 
-    if (vad_min_speech_ms < 0) vad_min_speech_ms = 0;
-    if (vad_min_silence_ms < 0) vad_min_silence_ms = 0;
+    if (vad_min_speech_ms < 20) vad_min_speech_ms = 20;
+    if (vad_min_silence_ms < 50) vad_min_silence_ms = 50;
     if (stt_partial_ms < 1) stt_partial_ms = 1;
     if (stt_window_ms < 1) stt_window_ms = 1;
     if (clause_max_words < 1) clause_max_words = 1;
