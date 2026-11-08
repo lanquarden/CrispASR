@@ -286,3 +286,39 @@ Verdict was fix-before-ship on two defects, both now fixed:
 4. **Flag clamps (LOW).** `vad_min_speech_ms >= 20`, `vad_min_silence_ms >= 50`.
 5. Comment corrected: the 40 ms confirmation clears `in_run_` on the first quiet
    window; the lookahead is what defers classification.
+
+
+## M2 — model tool calls, filler policy, model choice
+
+**Tool calls (real, Qwen3-0.6B then 1.7B):** the model emits one JSON object;
+a strict prompt plus the loop's lenient parser gives **9/9 schema-valid** on the
+real scenario and 10/10 on a transcript sweep, 8/10 semantically right. The only
+real failure is semantic ("turn on the living room lights" -> `set_timer 5`),
+so a grammar sampler would buy nothing today; that stays a later upstream PR.
+Dispatch is speculative (default device check at FINAL, corrected/cancelled by a
+generation counter when the model's call arrives); a review finding proved a
+stale result could win the turn, now fixed by stamping gen/epoch on the event and
+re-checking in the handler (`toolcall_stale` proves the drop).
+
+**Filler policy:** 81-cell sweep (filler mode x low/target water x clause size).
+Bank is the default: 120 ms WAV gap and 1.37 s result->answer, versus 2.16 s for
+LLM filler, which also leaks results ("the door is closed") and repeats less.
+`clause_max_words` is inert for answers (they split at sentence boundaries).
+Kept: two-clause reserve, session-wide no-repeat, bank fallback, centred
+deadline, Spanish bank.
+
+**Model:** `MODEL-BENCH.md` compares 0.6B and 1.7B on 10 EN + 10 ES utterances.
+1.7B wins: ES argument accuracy 43 % -> 90 %, code-switching 27 % -> 3 %, JSON
+100 %, at +10 ms TTFT. **Use `Qwen3-1.7B-Q8_0`.** Independently, the ack prompt
+was asking the model to "restate what you understood", which both models
+answered as a result; removing that clause drops result claims to 0/10 EN.
+
+**Real ES:** transcript correct, ack now Spanish and non-interrogative
+("Estoy verificando el estado de la puerta del garaje."), WAV gap 100 ms.
+The answer can still mix languages because the *simulated task result* is
+English; that is a fixture, not the model.
+
+**Caveat:** the M1 gap/latency numbers are not directly comparable to M2 runs —
+filler policy, dispatch ordering and model changed. Re-baselined M2 numbers:
+`delegation_real` 120-300 ms WAV gap, 810-890 ms audible; `es_real` 100 ms,
+1080-1100 ms.
