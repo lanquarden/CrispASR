@@ -176,30 +176,43 @@ class SincDecimator {
 // verbatim (no gain, no reordering), and the output is a subsequence of the
 // input.
 //
-// A window counts as speech only when it belongs to a *sustained* loud stretch:
-// 40 ms (4 windows) of consecutive above-floor windows. Classification is
-// therefore deferred by one 40 ms lookahead, so the answer is available in the
-// same streaming pass. Windows inside the hangover of a confirmed stretch stay
-// on the speech side; isolated 10-20 ms blips do not, which matters because the
+// Speech is *confirmed*, not detected. A loud window only counts once hangover_
+// (4 x 10 ms = 40 ms) consecutive above-floor windows have been seen, and
+// classification is deferred by that lookahead so the test is decidable in one
+// streaming pass: when the head window is classified its three successors are
+// already buffered. The head window of a run is therefore classified on itself
+// -- there is no retroactive promotion of earlier windows and no hangover that
+// keeps the speech side alive -- while in_run_ carries a confirmation forward
+// into the windows that continue the same loud stretch. The first quiet window
+// clears in_run_, so the very next loud window must earn its own 40 ms again.
+// Isolated 10-20 ms blips therefore never confirm, which matters because the
 // model's decay noise sits between 0.006 and 0.01 and would otherwise cut a
 // pause into pieces shorter than the 220 ms cap (measurement and the rejected
-// alternative are documented at classify()).
+// alternative are documented at classify()). flush() has no lookahead left, so
+// there a trailing run of >= 2 loud windows (20 ms) is accepted as the last
+// evidence the piece can offer.
 //
-//   leading   drop everything before the first loud window, then prepend up to
-//             20 ms of the silence immediately before it as pre-roll
-//   mid       hold silence, bounded at 220 ms: when a loud window arrives the
-//             held silence is emitted (a natural pause is preserved verbatim);
-//             past 220 ms the surplus is dropped as it arrives, so an internal
-//             pause can never exceed 220 ms
+//   leading   drop everything before the first confirmed window, then prepend up
+//             to 20 ms of the silence immediately before it as pre-roll
+//   mid       hold silence, bounded at 220 ms: when a confirmed window arrives
+//             the held silence is emitted (a natural pause is preserved
+//             verbatim); past 220 ms the surplus is dropped as it arrives, so
+//             an internal pause can never exceed 220 ms
 //   trailing  at flush, drop everything after the last loud window except a
 //             40 ms pad
 //
-// Holding is what lets the trailing rule work: silence after the last loud
+// Holding is what lets the trailing rule work: silence after the last confirmed
 // window is never written ahead of the decision, so a pause the mid rule
 // truncated to 220 ms can still be shortened to the 40 ms pad at the end of the
-// piece instead of being emitted as a 220 ms gap. Worst-case added latency is
-// the 40 ms hangover lookahead plus the 220 ms hold, and during both there is
-// no audio that was cleared for playback anyway.
+// piece instead of being emitted as a 220 ms gap. The hold is a reservoir of
+// windows with a raw-loud flag each, capped by dropping the *oldest* window: the
+// silence the cap exists to throw away is the part farthest from whatever comes
+// next, and the newest windows are the ones a pending 40 ms confirmation may
+// turn into speech. Older loud windows age out like silence -- once a quiet
+// window has followed them they are blips that can never confirm, and keeping
+// them would let a pause dappled with decay noise grow past the cap. Worst-case
+// added latency is the 40 ms lookahead plus the 220 ms hold, and during both
+// there is no audio that was cleared for playback anyway.
 //
 // --- gate-begin ---
 class SilenceGate {
@@ -220,9 +233,14 @@ class SilenceGate {
     void reset() {
         started_ = false;
         in_run_ = false;
+        tail_ = false;
         in_.clear();
         lead_.clear();
         hold_.clear();
+        hold_loud_.clear();
+        hold_samples_ = 0;
+        pend_.clear();
+        pend_raw_.clear();
         ready_.clear();
     }
 
@@ -230,9 +248,9 @@ class SilenceGate {
     // *out. The caller drains *out per chunk, so nothing here grows without
     // bound: in_ < win_, lead_ <= 20 ms, hold_ <= 220 ms, pend_ <= 50 ms.
     //
-    // Classification is deferred by one 40 ms hangover so "is this window
-    // speech?" can be answered with the windows on both sides of it; samples
-    // are buffered, never reordered.
+    // Classification is deferred by the 40 ms lookahead, so "does this window
+    // open a confirmed loud run?" is answered from the window itself and its
+    // successors; samples are buffered, never reordered.
     void feed(const float* pcm, int n, std::vector<float>* out) {
         if (!out) return;
         if (pcm != nullptr && n > 0) in_.insert(in_.end(), pcm, pcm + n);
@@ -255,13 +273,16 @@ class SilenceGate {
             push_window(in_.data(), (int)in_.size());
             in_.clear();
         }
-        while (!pend_.empty()) emit_head();  // no lookahead left to confirm more
+        // No lookahead left, so a 20 ms trailing loud run is the strongest
+        // evidence this piece still has; a lone 10 ms window stays a blip.
+        tail_ = true;
+        while (!pend_.empty()) emit_head();
+        tail_ = false;
         lead_.clear();  // a piece that never gets loud emits nothing
-        if (started_ && !hold_.empty()) {
-            const size_t keep = std::min<size_t>((size_t)pad_, hold_.size());
-            ready_.insert(ready_.end(), hold_.begin(), hold_.begin() + keep);
-        }
+        if (started_ && !hold_.empty()) emit_hold_tail();
         hold_.clear();
+        hold_loud_.clear();
+        hold_samples_ = 0;
         out->insert(out->end(), ready_.begin(), ready_.end());
         ready_.clear();
     }
@@ -274,12 +295,13 @@ class SilenceGate {
         return std::sqrt(acc / n) > floor_;
     }
 
-    // A window counts as speech only when it belongs to a *sustained* loud
-    // stretch: a run of hangover_ (4 x 10 ms = 40 ms) consecutive above-floor
-    // windows. The delay in the internal buffer is what makes this answerable
-    // in one pass -- when the head window is classified, its three successors
-    // are already buffered, and a run confirmed at an earlier window keeps the
-    // whole stretch on the speech side through in_run_.
+    // A window counts as speech when it opens a *sustained* loud stretch: a run
+    // of hangover_ (4 x 10 ms = 40 ms) consecutive above-floor windows starting
+    // at this one. The lookahead in the internal buffer is what makes this
+    // answerable in one pass -- when the head window is classified, its three
+    // successors are already buffered. A window that continues an already
+    // confirmed stretch is speech through in_run_; the first quiet window
+    // clears that flag, so confirmation is never inherited across a pause.
     //
     // Why sustained rather than "within 40 ms of a loud window": the model's
     // decay noise sits between 0.006 and 0.01, so a pause is dappled with
@@ -310,22 +332,30 @@ class SilenceGate {
                 in_run_ = true;
                 return true;
             }
+            return false;  // blip shorter than the hangover: silence, not speech
         }
-        return false;  // blip shorter than the hangover: silence, not speech
+        // End of piece: fewer than hangover_ windows remain, so the 40 ms test
+        // can never pass again. A trailing run of 20 ms is the best evidence the
+        // piece can still give and is kept; a single 10 ms window stays a blip.
+        if (tail_ && pend_raw_.size() >= 2 && pend_raw_[1] != 0) {
+            in_run_ = true;
+            return true;
+        }
+        return false;
     }
 
     // Acts on the oldest buffered window (loud -> speech, quiet -> lead/hold).
     void emit_head() {
         const bool is_loud = classify();
-        const std::vector<float>& s = pend_.front();
+        const bool raw = pend_raw_.front() != 0;
+        std::vector<float> s = std::move(pend_.front());
         if (is_loud) {
             if (!started_) {
                 started_ = true;
                 ready_.insert(ready_.end(), lead_.begin(), lead_.end());
                 lead_.clear();
-            } else if (!hold_.empty()) {
-                ready_.insert(ready_.end(), hold_.begin(), hold_.end());
-                hold_.clear();
+            } else {
+                flush_hold();  // a natural pause is preserved verbatim
             }
             ready_.insert(ready_.end(), s.begin(), s.end());
         } else if (!started_) {
@@ -334,11 +364,74 @@ class SilenceGate {
             if ((int)lead_.size() > preroll_)
                 lead_.erase(lead_.begin(), lead_.end() - preroll_);
         } else {
-            hold_.insert(hold_.end(), s.begin(), s.end());
-            if ((int)hold_.size() > hold_cap_) hold_.resize((size_t)hold_cap_);
+            hold_window(std::move(s), raw);
         }
         pend_.erase(pend_.begin());
         pend_raw_.erase(pend_raw_.begin());
+    }
+
+    void flush_hold() {
+        for (auto& w : hold_) ready_.insert(ready_.end(), w.begin(), w.end());
+        hold_.clear();
+        hold_loud_.clear();
+        hold_samples_ = 0;
+    }
+
+    // Adds one window to the hold reservoir, then enforces the 220 ms cap by
+    // dropping the oldest window. The trailing raw-loud run is never dropped:
+    // its 40 ms confirmation is still pending, so it may be the onset of the
+    // next word and truncating the end of the hold would lose exactly that
+    // audio. A loud window that silence has already followed can never confirm
+    // (it is a decay-noise blip), so it ages out like silence -- otherwise every
+    // blip in a long pause would push the emitted pause past the cap.
+    void hold_window(std::vector<float>&& s, bool loud) {
+        hold_samples_ += (int)s.size();
+        hold_loud_.push_back(loud ? 1u : 0u);
+        hold_.push_back(std::move(s));
+        size_t droppable = hold_loud_.size();  // windows ahead of the loud tail
+        while (droppable > 0 && hold_loud_[droppable - 1]) --droppable;
+        while (hold_samples_ > hold_cap_ && droppable > 0) {
+            hold_samples_ -= (int)hold_.front().size();
+            hold_.erase(hold_.begin());
+            hold_loud_.erase(hold_loud_.begin());
+            --droppable;
+        }
+    }
+
+    // End of piece: the pad is anchored to the LAST loud window, not to the
+    // front of the hold, so a short final onset that never earned its 40 ms
+    // confirmation is emitted instead of being cut off. What survives is the
+    // loud run ending at that window plus the pad after it: the silence in front
+    // of it is dead air the gate exists to remove (measured on the real engine:
+    // keeping the whole hold made every piece ~100 ms longer and pushed the
+    // worst WAV silence run from 100 ms to 180 ms, and the run this keeps sits
+    // at the noise floor where a splice is inaudible). A confirmed onset of
+    // >= 20 ms never reaches this path -- flush() promotes it to speech and the
+    // ordinary trailing rule applies. A hold with no loud window is pure
+    // silence and keeps only the pad, as before.
+    void emit_hold_tail() {
+        size_t last_loud = hold_loud_.size();
+        for (size_t k = 0; k < hold_loud_.size(); ++k)
+            if (hold_loud_[k]) last_loud = k;
+        if (last_loud == hold_loud_.size()) {
+            size_t remaining = (size_t)pad_;
+            for (size_t k = 0; k < hold_.size() && remaining > 0; ++k) {
+                const size_t n = std::min(remaining, hold_[k].size());
+                ready_.insert(ready_.end(), hold_[k].begin(), hold_[k].begin() + n);
+                remaining -= n;
+            }
+            return;
+        }
+        size_t first = last_loud;
+        while (first > 0 && hold_loud_[first - 1]) --first;  // the run, not the silence
+        for (size_t k = first; k <= last_loud; ++k)
+            ready_.insert(ready_.end(), hold_[k].begin(), hold_[k].end());
+        size_t remaining = (size_t)pad_;
+        for (size_t k = last_loud + 1; k < hold_.size() && remaining > 0; ++k) {
+            const size_t n = std::min(remaining, hold_[k].size());
+            ready_.insert(ready_.end(), hold_[k].begin(), hold_[k].begin() + n);
+            remaining -= n;
+        }
     }
 
     void push_window(const float* s, int n) {
@@ -353,13 +446,16 @@ class SilenceGate {
     int hangover_ = 4;  // consecutive loud 10 ms windows (40 ms) = speech
     double floor_ = 0.006;
     bool started_ = false;
-    bool in_run_ = false;  // current window sits inside a confirmed loud run
-    std::vector<float> in_;              // input tail shorter than one window
-    std::vector<float> lead_;            // silence before the first loud window
-    std::vector<float> hold_;            // post-speech silence awaiting a decision
+    bool in_run_ = false;  // current window continues a confirmed loud run
+    bool tail_ = false;    // flush(): no lookahead left, accept a 20 ms run
+    std::vector<float> in_;        // input tail shorter than one window
+    std::vector<float> lead_;      // silence before the first confirmed window
+    std::vector<std::vector<float>> hold_;  // post-speech windows awaiting a decision
+    std::vector<unsigned char> hold_loud_;   // their raw above-floor flags
+    int hold_samples_ = 0;                  // samples in hold_, for the cap
     std::vector<std::vector<float>> pend_;  // windows awaiting classification
     std::vector<unsigned char> pend_raw_;   // their above-floor flags
-    std::vector<float> ready_;           // cleared by the caller, never reordered
+    std::vector<float> ready_;              // cleared by the caller, never reordered
 };
 // --- gate-end ---
 
@@ -479,6 +575,9 @@ class CrispasrTtsEngine : public TtsEngine {
             cb(out_.data(), (int)out_.size(), true);
         } else if (emitted_any_) {
             // Piece ended on a loud window: keep is_final on the last chunk.
+            // The caller ignores is_final today (voice_loop.cpp drops it), so
+            // this empty chunk exists only to close the callback contract: a
+            // piece always ends with exactly one is_final chunk, empty or not.
             float none = 0.0f;
             cb(&none, 0, true);
         }

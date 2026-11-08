@@ -232,7 +232,7 @@ The pipeline (VAD-declared end -> first audible) is ~250-290 ms. The rest of the
 | 500 ms (old) | 1050 ms | 100 ms |
 | 250 ms | 830 ms | 100 ms |
 | 150 ms | 710 ms | 100 ms |
-| **250 ms (new default, after review)** | **~830 ms** | **100 ms** |
+| **250 ms (new default, after review)** | **810 ms p50 / 830 ms p95** | **120 ms** |
 | 150 ms, before the silence gate | — | 360 ms |
 
 This mirrors HF's choice (Silero `min_silence_ms=64` plus a smart-turn model).
@@ -246,15 +246,19 @@ The silence gate plus the 40 ms speech-confirmation lookahead adds a fixed
 ~40 ms before a piece's first emitted sample; that is inside the measured
 audible number, not on top of it.
 
-The 100 ms residual is a quiet span inside the ack plus one piece boundary;
+The 120 ms residual is one quiet span inside the ack plus one piece boundary;
 the gate drops quiet runs >220 ms and keeps natural pauses <=150 ms verbatim.
+The 100 -> 120 ms change after the hold-cap fix is not new dead air: replaying
+the same 33 real TTS pieces through both gate revisions gives 21/33 bit-identical
+outputs and the other 12 differ only in their last 10-20 ms, where the new gate
+keeps soft decay windows (0.006-0.01) it used to truncate.
 
 ## Final automated result
 
 ```
 barge_in         ok   wav_gap=0ms    audible_p50=920ms
 delegation       ok   wav_gap=0ms    audible_p50=900ms
-delegation_real  ok   wav_gap=100ms  audible_p50=710ms  p95=730ms
+delegation_real  ok   wav_gap=120ms  audible_p50=810ms  p95=830ms
 es_smoke         ok   wav_gap=0ms    audible_p50=910ms
 short            ok   wav_gap=0ms    audible_p50=920ms
 task_failure     ok   wav_gap=0ms    audible_p50=900ms
@@ -270,8 +274,10 @@ Verdict was fix-before-ship on two defects, both now fixed:
    loud-but-unconfirmed onset was appended and then truncated from the end, and
    `flush()` anchored its 40 ms pad to the front of the hold. A word after an
    internal pause could be clipped or lost. Fix: per-window loud flags, drop
-   quiet windows from the front at cap (never loud ones), anchor the flush pad
-   to the last loud window.
+   quiet windows from the front at cap (never the protected trailing loud run),
+   anchor the flush pad to the last loud window. Verified with 36/36 gate unit
+   cases, including "hold at cap + tone" (full tone) and "20 ms final tail"
+   (kept; the old gate emitted none of it).
 2. **Short final onsets (LOW/MEDIUM).** `flush()` now treats a trailing raw-loud
    run of >=2 windows (20 ms) as confirmed.
 3. **Mid-sentence commits (MEDIUM).** Fixed by restoring the 250 ms default; the
