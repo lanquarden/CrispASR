@@ -65,6 +65,11 @@ struct AudioLedger {
     std::deque<Piece> pieces;
     int64_t last_played = 0;
 
+    void clear() {
+        std::lock_guard<std::mutex> lk(mu);
+        pieces.clear();
+        last_played = 0;
+    }
     void add(TextKind k, int64_t n) {
         std::lock_guard<std::mutex> lk(mu);
         if (std::getenv("VOICE_DEBUG"))
@@ -211,13 +216,13 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
     // ---- LLM: one generation at a time, FIFO --------------------------------
     std::mutex llm_mu;
     std::deque<std::pair<TextKind, std::string>> llm_pending;
-    bool llm_busy = false;
+    std::atomic<bool> llm_busy{false};
 
     std::function<void()> pump_llm = [&] {
         std::pair<TextKind, std::string> item;
         {
             std::lock_guard<std::mutex> lk(llm_mu);
-            if (llm_busy || llm_pending.empty()) return;
+            if (llm_busy.load() || llm_pending.empty()) return;
             llm_busy = true;
             item = llm_pending.front();
             llm_pending.pop_front();
@@ -275,6 +280,7 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
                 std::lock_guard<std::mutex> lk(llm_mu);
                 llm_busy = false;
             }
+            if (my_epoch != epoch.load()) return;  // aborted: no stale done event
             Event done;
             done.type = EventType::Tick;
             done.aux = kLlmDone + (int64_t)kind;
@@ -288,13 +294,13 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
     // ---- TTS: one piece at a time, FIFO (ordering is audible) ---------------
     std::mutex tts_mu;
     std::deque<TextSegment> tts_pending;
-    bool tts_busy = false;
+    std::atomic<bool> tts_busy{false};
 
     std::function<void()> pump_tts = [&] {
         TextSegment seg;
         {
             std::lock_guard<std::mutex> lk(tts_mu);
-            if (tts_busy || tts_pending.empty()) return;
+            if (tts_busy.load() || tts_pending.empty()) return;
             // Backpressure: synthesising 4x faster than playback must not
             // outrun the ring. The answer is exempt: it must be buffered the
             // moment it exists, or it waits for the watermark to drain.
@@ -324,6 +330,7 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
                 std::lock_guard<std::mutex> lk(tts_mu);
                 tts_busy = false;
             }
+            if (my_epoch != epoch.load()) return;  // aborted: no stale done event
             Event done;
             done.type = EventType::Tick;
             done.aux = kTtsDone;
@@ -366,6 +373,7 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
                 case ActionType::FlushAudio: {
                     epoch.fetch_add(1);
                     ring.clear();
+                    ledger.clear();
                     {
                         std::lock_guard<std::mutex> lk(tts_mu);
                         tts_pending.clear();
@@ -671,7 +679,8 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
     writer.finish();
     task.shutdown();
     arbiter.stop();
-    if (!run.ok) run.ok = true;
+    // run.ok is set only by a FinishTurn action: a turn that never completed
+    // is reported as a failure instead of being masked.
     return run;
 }
 

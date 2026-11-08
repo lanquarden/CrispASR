@@ -406,7 +406,10 @@ void SpeechSequencer::on_playback(int64_t buffer_ms, int64_t played_ms,
         // synthesise the answer.
         const bool awaiting_answer_audio =
             answer_text_ms_ > 0 && !answer_buffered_;
-        if (clauses_.empty() && (task_pending_ || awaiting_answer_audio) &&
+        // Keep two clauses queued, not one: a single in-flight filler leaves
+        // the buffer dry while the next one is still synthesising.
+        if (turn_active() && clauses_.size() < 2 &&
+            (task_pending_ || awaiting_answer_audio) &&
             metrics_.ack_first_played_ms > 0 && t_ms - last_filler_ms_ > 300) {
             last_filler_ms_ = t_ms;
             maybe_request_filler("low-water", t_ms);

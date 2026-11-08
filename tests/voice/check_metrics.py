@@ -443,6 +443,8 @@ def wav_max_silence_run_ms(path, frame_ms=20, rms_threshold=0.01):
             started = True
         elif started and run_start is None:
             run_start = i
+    if run_start is not None:
+        runs.append((len(samples) - run_start) * 1000 // rate)
     return max(runs) if runs else 0
 
 

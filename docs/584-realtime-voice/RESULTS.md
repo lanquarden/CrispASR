@@ -51,11 +51,14 @@ Scenario `delegation_real`: real question WAV (TTS-generated), 6 s task.
 - transcript: *"The status of the garage door."* (ASR correct)
 - ack: *"The status of the garage door. I am checking."*
 - answer: *"Garage door status is complete."*
-- end of speech -> first played: **255-275 ms**
-- fillers: 1-2 bank phrases
+- end of speech -> first played: **251-275 ms**
+- fillers: 1-3 bank phrases (two-clause queue depth)
 - barge-in: flush + cancel, 5 ms processing stop (harness-injected marker)
-- **WAV-measured worst silent run: 500 ms** (was 2180 ms before per-piece
-  silence trimming) — still above the 300 ms M1 tolerance; target is 150 ms
+- **WAV-measured worst acoustic silence (RMS < 0.01): 500 ms** (was 2180 ms
+  before per-piece silence trimming) — above the 300 ms M1 tolerance; the runs
+  are scattered at piece boundaries (0.32-0.50 s), so the next step is to
+  distinguish real pipeline holes from soft word onsets by listening to
+  `tests/voice/out/delegation_real/run*.wav`
 - self-reported `max_gap_ms`: 10 ms; the WAV check stays the authority
 - answer starts 3.4 s after the task result (bridge is deliberately kept until
   the answer's first PCM exists; this is the M2 tuning knob)
@@ -115,8 +118,8 @@ VOICE_REAL_ENGINES=1 build-vk/bin/crispasr-voice \
    filler ending and the answer's first PCM. M2: per-piece trace + watermark
    sweep.
 2. **Gap accounting under-reports** (10 ms reported vs 500 ms measured). The
-   sequencer counts only starved frames after the ack has been played; the
-   harness measures the WAV, but the internal number must be made trustworthy.
+   sink only sees ring underflow; the model emits silence inside pieces, which
+   is why the WAV check exists. The sequencer's own number is diagnostic only.
 3. **Ack phrasing leaks the third person** in some samples ("The status of the
    garage door is currently unknown") — prompt and word cap are in; needs a
    couple of prompt/decoding iterations.

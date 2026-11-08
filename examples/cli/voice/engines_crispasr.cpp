@@ -7,6 +7,8 @@
 #include <atomic>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -118,6 +120,7 @@ class CrispasrTtsEngine : public TtsEngine {
         resample_pending_.clear();
         resample_pos_ = 0.0;
         started_ = false;
+        emitted_once_ = false;
         work_.clear();
 
         be_->synthesize_streaming(text, p_, [&](const float* pcm, int n, bool final) {
@@ -199,6 +202,14 @@ class CrispasrTtsEngine : public TtsEngine {
     // Emit everything except a 250 ms hold so trailing silence can be trimmed
     // when the model ends the piece.
     void emit_steady(PcmCallback& cb, bool) {
+        if (!emitted_once_ && std::getenv("VOICE_DEBUG")) {
+            emitted_once_ = true;
+            double acc = 0.0;
+            const size_t k = std::min<size_t>(work_.size(), 160);
+            for (size_t i = 0; i < k; ++i) acc += (double)work_[i] * work_[i];
+            std::fprintf(stderr, "[dbg] tts first emit rms=%.4f\n",
+                         k ? std::sqrt(acc / k) : 0.0);
+        }
         const size_t hold = (size_t)cfg_.sample_rate / 4;
         if (work_.size() <= hold) return;
         const size_t n = work_.size() - hold;
@@ -210,6 +221,7 @@ class CrispasrTtsEngine : public TtsEngine {
     whisper_params p_;
     std::unique_ptr<CrispasrBackend> be_;
     bool started_ = false;
+    bool emitted_once_ = false;
     std::vector<float> work_;
     int in_rate_ = 24000;
     std::vector<float> resample_pending_;
