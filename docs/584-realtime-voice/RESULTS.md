@@ -322,3 +322,33 @@ English; that is a fixture, not the model.
 filler policy, dispatch ordering and model changed. Re-baselined M2 numbers:
 `delegation_real` 120-300 ms WAV gap, 810-890 ms audible; `es_real` 100 ms,
 1080-1100 ms.
+
+
+## M3 — speculative ack (opt-in, `--speculate`)
+
+The loop builds an ack from a stable partial (>=3-word shared prefix, >=600 ms of
+speech), synthesises it into a side buffer, and only plays it if the final
+transcript still matches that prefix. Nothing is spoken before VAD commits.
+
+Real A/B, same binary, Qwen3-1.7B chat, 2 measured runs + warmup:
+
+| | baseline | `--speculate` | delta |
+|---|---|---|---|
+| audible p50 (delegation, WAV-derived) | 910 ms | **590 ms** | **-320 ms** |
+| audible p50 (Spanish) | 1080 ms | **740 ms** | -340 ms |
+| worst WAV silence (delegation) | 300 ms | **100 ms** | -200 ms |
+| speculative attempts / hits / discards | 0/0/0 | **1/1/0** | — |
+| played ack (verified by re-ASR of the WAV) | "I am checking the status of the garage door." | "I am checking." | — |
+
+Wrong-ack rate is 0 by construction: only a prefix match can produce a hit, and
+only a hit pushes PCM. The prepared ack is shorter (it saw only the prefix), so
+the filler bridge plays two more phrases; the answer still arrives ~285 ms
+sooner. The design's +100 ms bar is met; no rollback.
+
+Also fixed while implementing: droppable STT-partial jobs held an in-flight
+counter that the arbiter never released for dropped jobs, so the loop could run
+to `max_turn_ms` and leave a 21-30 s silent tail. Partials no longer hold a
+slot; `stt_partials_dropped` now reports the real number.
+
+`--speculate` stays opt-in: the ack is shorter and the guard is conservative;
+making it the default is a product decision, not a measurement one.

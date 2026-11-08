@@ -182,6 +182,21 @@ struct TurnMetrics {
     // redispatch shows up here and not there.
     int task_dispatches = 0;
 
+    // M3: the ack pre-rendered on a stable partial transcript (see
+    // speculation.h and SPECULATION.md).
+    //   attempts  prepared acks started (LLM request queued for a stable
+    //             prefix); counted at queue time, like tool_calls;
+    //   hits      prepared PCM actually pushed at the final transcript, which
+    //             always implies the prefix matched the final and the audio was
+    //             younger than 3 s;
+    //   discards  prepared acks dropped without ever being played: superseded
+    //             prefix, stale at commit, prefix mismatch, turn flushed.
+    // A hit whose prefix did not match is not representable: the match is what
+    // pushes the PCM.
+    int speculative_attempts = 0;
+    int speculative_hits = 0;
+    int speculative_discards = 0;
+
     int tts_pieces = 0;
     int64_t tts_ttfa_ms = 0;
     int64_t tts_block_max_ms = 0;

@@ -24,6 +24,7 @@
 #include "arbiter.h"
 #include "audio_io.h"
 #include "sequencer.h"
+#include "speculation.h"
 #include "stt_driver.h"
 #include "task_adapter.h"
 #include "tool_call.h"
@@ -154,6 +155,30 @@ struct PendingSpeak {
     int64_t request_ms = 0;
     int turn = 0;
     int64_t base_ms = 0;
+};
+
+// M3: the prepared ack's audio side. speculation.h decides *whether* one exists
+// and whether it may be played; this holds the PCM, which the arbiter thread
+// writes and the control thread commits. Nothing here is ever pushed into the
+// playback ring while the turn is uncommitted: that is the whole safety
+// property of the design (never speak while the user is still talking).
+struct PreparedAckAudio {
+    std::mutex mu;
+    speculation::PreparedAckBook book;  // guarded by mu as well: it is read from
+                                        // the arbiter thread via current()
+    std::vector<float> pcm;
+    std::string text;
+    int64_t text_ms = 0;  // when the ack text became available
+    bool text_ready = false;
+    bool pcm_ready = false;
+
+    bool complete() const { return text_ready && pcm_ready && !pcm.empty(); }
+    void clear_audio() {
+        pcm.clear();
+        text.clear();
+        text_ms = 0;
+        text_ready = pcm_ready = false;
+    }
 };
 
 // `--out` is the output WAV in single-run mode and a directory in harness mode.
@@ -325,6 +350,20 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
 
     const std::string lang_rule =
         cfg.language == "es" ? " Responde siempre en español." : std::string();
+    // The ack system prompt is shared by the committed path (pump_llm) and the
+    // speculative one (spec_attempt): a prepared ack has to answer exactly the
+    // question the ack it replaces would have answered. The user half of the
+    // prompt is owned by SpeechSequencer::on_final; speculation::ack_user_prompt
+    // mirrors it, because sequencer.cpp is not this milestone's file.
+    auto ack_system_prompt = [&]() {
+        return std::string(
+                   "You are a voice assistant speaking to the user. Reply in first "
+                   "person, at most eight words. Acknowledge what was asked and say "
+                   "you are checking. Never mention \"the user\" or restate the "
+                   "request in the third person. No quotation marks, no markdown. "
+                   "Never state a result you do not have.") +
+               lang_rule;
+    };
     std::function<void()> pump_llm = [&] {
         PendingText item;
         {
@@ -344,12 +383,7 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
             ChatMessage sys;
             sys.role = "system";
             if (kind == TextKind::Ack) {
-                sys.content =
-                    "You are a voice assistant speaking to the user. Reply in first "
-                    "person, at most eight words. Acknowledge what was asked and say "
-                    "you are checking. Never mention \"the user\" or restate the "
-                    "request in the third person. No quotation marks, no markdown. "
-                    "Never state a result you do not have." + lang_rule;
+                sys.content = ack_system_prompt();
             } else if (kind == TextKind::Filler) {
                 sys.content =
                     "You are a voice assistant. Say one short, natural holding "
@@ -500,6 +534,200 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
         });
     };
 
+    // ---- M3: speculative ack ------------------------------------------------
+    // On a stable partial transcript, ask for the ack text and synthesise it
+    // into a side buffer. Nothing is pushed into the playback ring and nothing
+    // is spoken: the turn is not committed yet, and speaking while the user is
+    // still talking is the one failure this design must not have. The PCM is
+    // released only at FinalTranscript, and only when the final still matches
+    // the prefix the ack was generated for (speculation.h owns that guard).
+    PreparedAckAudio prepared;
+    // Control-thread view of a committed prepared ack.
+    bool suppress_ack_request = false;  // skip the ack LLM request (text exists)
+    bool armed_ack_audio = false;       // Ack clauses are served by this PCM
+    std::vector<float> armed_ack_pcm;
+    std::string armed_ack_text;
+    std::string previous_partial;  // normalised, for the stability rule
+
+    auto spec_sync_metrics = [&]() {
+        std::lock_guard<std::mutex> lk(prepared.mu);
+        seq.metrics().speculative_attempts = prepared.book.attempts();
+        seq.metrics().speculative_hits = prepared.book.hits();
+        seq.metrics().speculative_discards = prepared.book.discards();
+    };
+    // A barge-in, a new turn, or a turn that ends without ever committing: no
+    // pre-rendered audio survives it, and a live entry is counted as a discard
+    // (it was built and never played).
+    auto spec_reset = [&]() {
+        std::lock_guard<std::mutex> lk(prepared.mu);
+        prepared.book.invalidate();
+        prepared.clear_audio();
+    };
+    auto spec_disarm = [&]() {
+        suppress_ack_request = false;
+        armed_ack_audio = false;
+        armed_ack_pcm.clear();
+        armed_ack_text.clear();
+    };
+
+    auto spec_attempt = [&](const std::string& stable, int64_t t_ms) {
+        speculation::PreparedAckBook::Start start;
+        uint64_t gen = 0;
+        {
+            std::lock_guard<std::mutex> lk(prepared.mu);
+            start = prepared.book.on_stable(stable, t_ms);
+            if (start == speculation::PreparedAckBook::Start::None) return;
+            gen = prepared.book.generation();
+            prepared.clear_audio();  // a replaced entry's PCM is dropped here
+            if (start == speculation::PreparedAckBook::Start::Replace &&
+                std::getenv("VOICE_DEBUG"))
+                std::fprintf(stderr, "[dbg] spec replace prefix='%.40s'\n",
+                             stable.c_str());
+        }
+        spec_sync_metrics();
+        const int64_t base_ms = seq.metrics().speech_start_ms;
+        const int turn = seq.turn_id();
+        const uint64_t my_epoch = epoch.load();
+        const std::string prompt = speculation::ack_user_prompt(stable);
+        const std::string system_prompt = ack_system_prompt();
+        if (std::getenv("VOICE_DEBUG"))
+            std::fprintf(stderr, "[dbg] spec begin gen=%llu prefix='%.40s'\n",
+                         (unsigned long long)gen, stable.c_str());
+        work_in_flight.fetch_add(1);
+        arbiter.post(Priority::Llm, "spec-llm",
+                     [&, gen, my_epoch, prompt, system_prompt, base_ms, turn] {
+            WorkGuard wg(work_in_flight);
+            std::vector<ChatMessage> msgs;
+            ChatMessage sys;
+            sys.role = "system";
+            sys.content = system_prompt;
+            ChatMessage user;
+            user.role = "user";
+            user.content = prompt;
+            msgs.push_back(sys);
+            msgs.push_back(user);
+            const int64_t started = steady_ms();
+            int64_t first_token = 0;
+            int tokens = 0;
+            std::string text;
+            // Bounded: once the entry is replaced or the turn is flushed, the
+            // next token stops the generation, so a superseded speculative
+            // request cannot sit in front of the committed ack.
+            auto on_token = [&](const std::string& piece) {
+                bool current;
+                {
+                    std::lock_guard<std::mutex> lk(prepared.mu);
+                    current = prepared.book.current(gen);
+                }
+                if (!current || my_epoch != epoch.load()) return false;
+                if (first_token == 0) first_token = steady_ms();
+                ++tokens;
+                text += piece;
+                return true;
+            };
+            engines.llm->generate(msgs, 64, on_token, std::string());
+            const int64_t finished = steady_ms();
+            // Quotes/markdown become pauses in qwen3-tts; the sequencer's own
+            // sanitiser runs later on the clause, so the PCM is rendered from
+            // the same words we hand it.
+            std::string cleaned = speculation::strip_speech_noise(text);
+            bool published = false;
+            {
+                std::lock_guard<std::mutex> lk(prepared.mu);
+                // A generation that produced only punctuation/whitespace is
+                // not speakable: the sequencer would drop the clause and the
+                // pre-rendered PCM would never be released, so it does not
+                // count as a prepared ack.
+                if (prepared.book.current(gen) && !cleaned.empty() &&
+                    !speculation::normalise(cleaned).empty()) {
+                    prepared.text = cleaned;
+                    prepared.text_ready = true;
+                    prepared.text_ms = finished;
+                    published = true;
+                }
+            }
+            {
+                TimelineRow row;
+                row.turn = turn;
+                row.stage = "spec";
+                row.kind = "llm";
+                row.text = cleaned;
+                row.t_request_ms = base_ms > 0 ? started - base_ms : -1;
+                row.t_job_start_ms = base_ms > 0 ? started - base_ms : -1;
+                row.t_first_pcm_ms =
+                    (first_token > 0 && base_ms > 0) ? first_token - base_ms : -1;
+                row.t_done_ms = base_ms > 0 ? finished - base_ms : -1;
+                row.samples = tokens;
+                timeline_trace().add(std::move(row));
+            }
+            if (!published || my_epoch != epoch.load()) return;
+            // Side-buffer synthesis. TtsIdle, not urgent: a prepared ack must
+            // never delay a committed piece, and the arbiter only preempts at
+            // job boundaries.
+            work_in_flight.fetch_add(1);
+            arbiter.post(Priority::TtsIdle, "spec-tts",
+                         [&, gen, my_epoch, cleaned, base_ms, turn] {
+                WorkGuard wg2(work_in_flight);
+                {
+                    std::lock_guard<std::mutex> lk(prepared.mu);
+                    if (!prepared.book.current(gen)) return;
+                }
+                if (my_epoch != epoch.load()) return;
+                std::vector<float> pcm;
+                AudibilityMeter meter(rate);
+                const int64_t job_started = steady_ms();
+                int64_t first_pcm = 0;
+                engines.tts->synthesize(cleaned, [&](const float* p, int n, bool) {
+                    const int64_t t = steady_ms();
+                    if (first_pcm == 0) first_pcm = t;
+                    meter.push(p, n);
+                    pcm.insert(pcm.end(), p, p + n);
+                });
+                meter.finish();
+                const int64_t job_done = steady_ms();
+                {
+                    TimelineRow row;
+                    row.turn = turn;
+                    row.stage = "spec";
+                    row.kind = "tts";
+                    row.text = cleaned;
+                    row.t_job_start_ms = base_ms > 0 ? job_started - base_ms : -1;
+                    row.t_first_pcm_ms =
+                        (first_pcm > 0 && base_ms > 0) ? first_pcm - base_ms : -1;
+                    row.t_first_audible_ms =
+                        (first_pcm > 0 && base_ms > 0 && meter.found())
+                            ? (first_pcm - base_ms) +
+                                  meter.first_window() * meter.window_ms()
+                            : -1;
+                    row.t_done_ms = base_ms > 0 ? job_done - base_ms : -1;
+                    row.samples = (int64_t)pcm.size();
+                    row.audible_ms = meter.audible_ms();
+                    timeline_trace().add(std::move(row));
+                }
+                if (my_epoch != epoch.load()) return;
+                std::lock_guard<std::mutex> lk(prepared.mu);
+                if (!prepared.book.current(gen) || pcm.empty()) return;
+                prepared.pcm = std::move(pcm);
+                prepared.pcm_ready = true;
+                if (std::getenv("VOICE_DEBUG"))
+                    std::fprintf(stderr, "[dbg] spec ready gen=%llu samples=%zu\n",
+                                 (unsigned long long)gen, prepared.pcm.size());
+            });
+        });
+    };
+
+    // Called for every partial transcript. Cheap when --speculate is off.
+    auto spec_on_partial = [&](const std::string& text, int64_t t_ms) {
+        if (!cfg.speculate) return;
+        if (seq.state() != TurnState::Listening) return;
+        const int64_t speech_ms = t_ms - seq.metrics().speech_start_ms;
+        const std::string stable =
+            speculation::stable_prefix(previous_partial, text, speech_ms);
+        previous_partial = speculation::normalise(text);
+        if (stable.empty()) return;
+        spec_attempt(stable, t_ms);
+    };
+
     // ---- TTS: one piece at a time, FIFO (ordering is audible) ---------------
     std::mutex tts_mu;
     std::deque<PendingSpeak> tts_pending;
@@ -593,6 +821,15 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
         for (Action& a : actions) {
             switch (a.type) {
                 case ActionType::RequestText: {
+                    if (a.kind == TextKind::Ack && suppress_ack_request) {
+                        // M3 hit: the ack text was generated (and synthesised)
+                        // while the user was still talking, so the committed
+                        // path must not generate it again. Skipped exactly once.
+                        suppress_ack_request = false;
+                        if (std::getenv("VOICE_DEBUG"))
+                            std::fprintf(stderr, "[dbg] spec ack request skipped\n");
+                        break;
+                    }
                     PendingText item;
                     item.kind = a.kind;
                     item.prompt = a.text;
@@ -611,6 +848,26 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
                         std::fprintf(stderr, "[dbg] speak kind=%d len=%zu text='%.30s'\n",
                                      (int)a.segment.kind, a.segment.text.size(),
                                      a.segment.text.c_str());
+                    if (a.segment.kind == TextKind::Ack && armed_ack_audio) {
+                        // M3 hit: the whole ack is one pre-rendered buffer, so
+                        // it is pushed once, on the first ack clause, and the
+                        // remaining clauses (the sequencer splits an ack at
+                        // sentence boundaries) get no synthesis at all. The
+                        // ledger entry is what sets ack_first_played_ms through
+                        // the normal playback path.
+                        if (!armed_ack_pcm.empty()) {
+                            ring.push(armed_ack_pcm.data(), (int)armed_ack_pcm.size());
+                            ledger.add(TextKind::Ack, (int64_t)armed_ack_pcm.size());
+                            seq.metrics().ack_first_pcm_ms = steady_ms();
+                            if (std::getenv("VOICE_DEBUG"))
+                                std::fprintf(stderr,
+                                             "[dbg] spec ack pushed samples=%zu text='%.40s'\n",
+                                             armed_ack_pcm.size(),
+                                             armed_ack_text.c_str());
+                            armed_ack_pcm.clear();
+                        }
+                        break;
+                    }
                     auto it = filler_pcm.find(a.segment.text);
                     if (a.segment.kind == TextKind::Filler && it != filler_pcm.end()) {
                         ring.push(it->second.data(), (int)it->second.size());
@@ -649,6 +906,11 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
                         tool_busy = false;
                     }
                     tool_request_pending = false;
+                    // A barge-in invalidates anything pre-rendered for the turn
+                    // it just flushed (counted as a discard, never played).
+                    spec_reset();
+                    spec_sync_metrics();
+                    spec_disarm();
                     engines.llm->request_abort();
                     seq.metrics().barge_in_stop_ms =
                         std::max<int64_t>(0, steady_ms() - a.arg);
@@ -658,6 +920,17 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
                     if (current_task_id > 0) tools.cancel(current_task_id);
                     break;
                 case ActionType::FinishTurn: {
+                    // A prepared ack still live here was never committed (empty
+                    // final, or a turn that ended before the partial arrived):
+                    // count it on the turn that built it, not on the next one.
+                    spec_reset();
+                    spec_sync_metrics();
+                    spec_disarm();
+                    // The arbiter owns the drop counter; the field existed but
+                    // was never filled. A dropped partial is an advisory job
+                    // that was superseded, so it is reported, not hidden.
+                    seq.metrics().stt_partials_dropped =
+                        arbiter.stats().dropped_partials;
                     TurnMetrics m = seq.metrics();
                     const int64_t base = m.speech_start_ms;
                     auto rel = [&](int64_t& v) {
@@ -801,10 +1074,18 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
                 std::vector<float> win = stt.partial_window();
                 const uint64_t my_epoch = epoch.load();
                 arbiter.drop_queued_partials();
-                work_in_flight.fetch_add(1);
+                // A partial is the one droppable job class: a newer partial
+                // supersedes it, and the arbiter destroys a dropped job without
+                // running its body. It therefore must not hold a
+                // work_in_flight slot — the guard would never fire, the counter
+                // would never return to zero, and the run would pad to
+                // max_turn_ms (a 30 s silent tail in the output WAV). Exiting
+                // with a queued partial is safe by design: it is advisory, and
+                // arbiter.stop() joins a *running* job before the loop's locals
+                // die. Found while measuring M3, where a speculative TTS job
+                // delays partials often enough to hit it.
                 arbiter.post(Priority::SttPartial, "stt-partial",
                              [&, win, my_epoch] {
-                    WorkGuard wg(work_in_flight);
                     if (my_epoch != epoch.load()) return;
                     AsrResult r =
                         engines.asr->transcribe(win.data(), (int)win.size(), 0);
@@ -823,11 +1104,21 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
             switch (e.type) {
                 case EventType::SpeechStart:
                     seq.on_speech_start(e.t_ms);
+                    // A new speech segment: anything pre-rendered for the
+                    // previous turn (or for a barge-in) is gone, and the
+                    // stability rule starts from an empty history.
+                    previous_partial.clear();
+                    spec_reset();
+                    spec_sync_metrics();
+                    spec_disarm();
                     break;
                 case EventType::PartialTranscript:
                     seq.on_partial(e.text, e.t_ms);
                     seq.metrics().stt_partials++;
                     seq.metrics().stt_partial_cost_ms += e.aux2;
+                    // M3: the only place a prepared ack is created. Nothing is
+                    // spoken here; the audio goes to a side buffer.
+                    spec_on_partial(e.text, e.t_ms);
                     break;
                 case EventType::FinalTranscript:
                     if (std::getenv("VOICE_DEBUG"))
@@ -836,6 +1127,75 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
                     seq.metrics().stt_final_cost_ms = e.aux2;
                     seq.metrics().transcript = e.text;
                     seq.on_final(e.text, e.t_ms);
+                    // M3: commit the prepared ack. A hit is the only path that
+                    // pushes pre-rendered audio, and commit() is the prefix +
+                    // age guard, so a mismatched prepared ack can never play
+                    // (it is counted as a discard instead). Only a turn the
+                    // sequencer actually committed to a delegation can speak:
+                    // anything else invalidates and counts the entry.
+                    if (cfg.speculate && seq.state() != TurnState::Delegating) {
+                        spec_reset();
+                        spec_sync_metrics();
+                    } else if (cfg.speculate) {
+                        speculation::PreparedAckBook::Outcome outcome =
+                            speculation::PreparedAckBook::Outcome::Miss;
+                        std::string prepared_text;
+                        int64_t prepared_text_ms = 0;
+                        {
+                            std::lock_guard<std::mutex> lk(prepared.mu);
+                            if (!prepared.book.live()) {
+                                outcome = speculation::PreparedAckBook::Outcome::Miss;
+                            } else if (!prepared.complete()) {
+                                // Started, never finished (the LLM or the TTS was
+                                // still running when the turn committed): it
+                                // cannot be played, so it is a discard. The
+                                // in-flight jobs see the bumped generation and
+                                // throw their output away.
+                                prepared.book.invalidate();
+                                prepared.clear_audio();
+                            } else {
+                                outcome = prepared.book.commit(e.text, e.t_ms);
+                                if (outcome ==
+                                    speculation::PreparedAckBook::Outcome::Hit) {
+                                    prepared_text = prepared.text;
+                                    prepared_text_ms = prepared.text_ms;
+                                    armed_ack_pcm = std::move(prepared.pcm);
+                                    prepared.pcm.clear();
+                                    prepared.text.clear();
+                                    prepared.text_ready = prepared.pcm_ready = false;
+                                } else {
+                                    prepared.clear_audio();
+                                }
+                            }
+                        }
+                        spec_sync_metrics();
+                        if (outcome == speculation::PreparedAckBook::Outcome::Hit) {
+                            armed_ack_audio = true;
+                            armed_ack_text = prepared_text;
+                            suppress_ack_request = true;
+                            seq.metrics().ack_text = prepared_text;
+                            // Feed the ack text through the sequencer as if the
+                            // LLM had just produced it: ack_words_, committed
+                            // speech and ack_emitted_ stay identical to the
+                            // non-speculative path, so the filler policy is not
+                            // disturbed by the audio substitution (only the PCM
+                            // source changes, in execute()).
+                            seq.on_text_delta(TextKind::Ack, prepared_text, e.t_ms);
+                            seq.on_text_done(TextKind::Ack, e.t_ms);
+                            // The ack text existed before the turn committed;
+                            // reporting the commit time as "ack text" time would
+                            // hide exactly the latency this milestone removes.
+                            seq.metrics().ack_text_ms = prepared_text_ms;
+                            if (std::getenv("VOICE_DEBUG"))
+                                std::fprintf(stderr,
+                                             "[dbg] spec HIT text='%.50s' age=%lldms\n",
+                                             prepared_text.c_str(),
+                                             (long long)(e.t_ms - prepared_text_ms));
+                        } else if (std::getenv("VOICE_DEBUG")) {
+                            std::fprintf(stderr, "[dbg] spec miss outcome=%d\n",
+                                         (int)outcome);
+                        }
+                    }
                     if (!e.text.empty()) {
                         if (tool_mode == ToolMode::Off) {
                             // Pre-M2 behaviour, kept as the regression baseline.

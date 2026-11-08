@@ -16,6 +16,7 @@
 #include "engines.h"
 #include "harness.h"
 #include "sequencer.h"
+#include "speculation.h"
 #include "tool_call.h"
 #include "voice_loop.h"
 #include "voice_types.h"
@@ -279,10 +280,119 @@ int selftest_impl() {
         check(!bridged, "filler finishing after the result does not queue a bank phrase");
     }
 
+    // 12. M3 speculation: the stability rule (3+ shared words, 600 ms speech,
+    //     punctuation and case are not part of stability).
+    {
+        using namespace crispasr::voice::speculation;
+        check(stable_prefix("The status of the garage... door",
+                            "the status of the garage door", 700) ==
+                  "the status of the garage door",
+              "spec: stability ignores case and punctuation");
+        check(stable_prefix("the status", "the status of", 700).empty(),
+              "spec: fewer than three shared words is not stable");
+        check(stable_prefix("the status of", "the status of the garage", 700) ==
+                  "the status of",
+              "spec: three shared words are a stable prefix");
+        check(stable_prefix("the status of", "the status of the garage", 500).empty(),
+              "spec: stability needs 600 ms of speech");
+        check(stable_prefix("the status of", "the status of the garage", 600) ==
+                  "the status of",
+              "spec: 600 ms of speech is enough");
+        check(stable_prefix("the status of the garage",
+                            "the status of the garage door", 1200) ==
+                  "the status of the garage",
+              "spec: a growing partial extends the stable prefix");
+    }
+
+    // 13. M3 speculation: the wrong-ack guard (prefix match vs mismatch) and
+    //     the freshness window.
+    {
+        using namespace crispasr::voice::speculation;
+        check(prefix_matches("the status of the garage door",
+                             "The status of the garage door."),
+              "spec: normalised prefix match accepted");
+        check(prefix_matches("the status of", "the status of the garage door"),
+              "spec: a short prefix matches its own continuation");
+        check(!prefix_matches("the status of the garage door",
+                              "what time is the meeting tomorrow"),
+              "spec: an unrelated final transcript is a mismatch");
+        check(!prefix_matches("the status of the garage door", ""),
+              "spec: an empty final transcript is a mismatch");
+        check(prefix_matches("turn on the living room lights",
+                             "turn on the lights in the living room"),
+              "spec: 80 % token overlap accepted (ASR revision)");
+        check(kMaxAgeMs == 3000, "spec: prepared ack freshness window is 3 s");
+    }
+
+    // 14. M3 speculation: attempts, hits and discards. A hit is only a hit when
+    //     the prepared prefix matches the final transcript and the audio is
+    //     fresh; everything else is a counted discard.
+    {
+        using namespace crispasr::voice::speculation;
+        PreparedAckBook b;
+        check(b.on_stable("the status of the garage door", 1000) ==
+                  PreparedAckBook::Start::Begin &&
+                  b.attempts() == 1 && b.discards() == 0,
+              "spec: first stable prefix starts and counts an attempt");
+        check(b.on_stable("the status of the garage door please", 1250) ==
+                      PreparedAckBook::Start::None &&
+                  b.attempts() == 1 && b.discards() == 0,
+              "spec: a growing stable prefix keeps the live prepared ack");
+        check(b.on_stable("what time is the meeting", 1500) ==
+                      PreparedAckBook::Start::Replace &&
+                  b.attempts() == 2 && b.discards() == 1,
+              "spec: a revised prefix replaces it and counts a discard");
+        check(b.commit("What time is the meeting tomorrow?", 1800) ==
+                      PreparedAckBook::Outcome::Hit &&
+                  b.hits() == 1,
+              "spec: a matching fresh final counts a hit");
+        check(b.commit("What time is the meeting tomorrow?", 1900) ==
+                      PreparedAckBook::Outcome::Miss &&
+                  b.hits() == 1 && b.discards() == 1,
+              "spec: a prepared ack is consumed by one hit");
+    }
+    {
+        using namespace crispasr::voice::speculation;
+        PreparedAckBook b;
+        b.on_stable("the status of the garage", 1000);
+        check(b.commit("the status of the garage door", 3000) ==
+                      PreparedAckBook::Outcome::Hit &&
+                  b.hits() == 1,
+              "spec: younger than 3 s at commit is playable");
+    }
+    {
+        using namespace crispasr::voice::speculation;
+        PreparedAckBook b;
+        b.on_stable("the status of the garage", 1000);
+        check(b.commit("the status of the garage door", 4000) ==
+                      PreparedAckBook::Outcome::Stale &&
+                  b.hits() == 0 && b.discards() == 1,
+              "spec: a prepared ack older than 3 s is a discard, never a hit");
+    }
+    {
+        using namespace crispasr::voice::speculation;
+        PreparedAckBook b;
+        b.on_stable("the status of the garage", 1000);
+        check(b.commit("what time is the meeting", 1500) ==
+                      PreparedAckBook::Outcome::Mismatch &&
+                  b.hits() == 0 && b.discards() == 1,
+              "spec: a prefix mismatch is a discard, never a hit");
+    }
+    {
+        using namespace crispasr::voice::speculation;
+        PreparedAckBook b;
+        b.on_stable("the status of the garage", 1000);
+        const uint64_t gen = b.generation();
+        b.invalidate();
+        check(!b.live() && !b.current(gen) && b.discards() == 1 &&
+                  b.commit("the status of the garage", 1200) ==
+                      PreparedAckBook::Outcome::Miss,
+              "spec: a barge-in invalidates the prepared ack");
+    }
+
     std::printf("%d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
 }
-
 }  // namespace
 
 int main(int argc, char** argv) {
