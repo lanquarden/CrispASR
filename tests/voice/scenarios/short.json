@@ -1,0 +1,11 @@
+{
+  "name": "short",
+  "input": "question_en.wav",
+  "task_ms": 0,
+  "runs": 3,
+  "warmup": 1,
+  "expect": {
+    "eos_to_first_played_ms_p95": 1800,
+    "answer_played": true
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "name": "barge_in",
+  "input": "question_en.wav",
+  "task_ms": 6000,
+  "task_fail_percent": 0,
+  "runs": 3,
+  "warmup": 1,
+  "barge_in_at_ms": 3000,
+  "expect": {
+    "barge_in_detected": true,
+    "barge_in_stop_ms": 250
+  }
+}

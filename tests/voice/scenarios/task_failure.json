@@ -1,0 +1,12 @@
+{
+  "name": "task_failure",
+  "input": "question_en.wav",
+  "task_ms": 6000,
+  "task_fail_percent": 100,
+  "runs": 3,
+  "warmup": 1,
+  "expect": {
+    "honest_failure_text": true,
+    "max_task_dispatches": 1
+  }
+}
