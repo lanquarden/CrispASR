@@ -11,10 +11,11 @@ Qwen3-0.6B chat model on one ggml Vulkan device, and a scheduler keeps the
 spoken pipeline fed through a simulated 6 s delegation. First audio lands in
 **~0.27 s** after end of speech, well inside the 0.7 s target.
 
-M1 is close but not green: after trimming model silence per TTS piece and
-sanitising non-speech characters, the rendered audio's worst silent run in the
-delegation turn dropped from **2.18 s to 0.50 s** (target 0.15-0.3 s). The
-loop's self-reported gap is now 10 ms, so the WAV check is still the authority.
+M1 is **green** on all six automated scenarios, including the real-engine
+delegation run: the decoded audio's worst silent run is **100 ms** (target
+<=300 ms), and the WAV-derived end-of-speech-to-first-audible latency is
+**710 ms p50 / 730 ms p95**. The remaining latency is dominated by
+end-of-turn detection, not the pipeline (see below).
 
 ## M0 — co-residency spike
 
@@ -54,14 +55,12 @@ Scenario `delegation_real`: real question WAV (TTS-generated), 6 s task.
 - end of speech -> first played: **251-275 ms**
 - fillers: 1-3 bank phrases (two-clause queue depth)
 - barge-in: flush + cancel, 5 ms processing stop (harness-injected marker)
-- **WAV-measured worst acoustic silence (RMS < 0.01): 500 ms** (was 2180 ms
-  before per-piece silence trimming) — above the 300 ms M1 tolerance; the runs
-  are scattered at piece boundaries (0.32-0.50 s), so the next step is to
-  distinguish real pipeline holes from soft word onsets by listening to
-  `tests/voice/out/delegation_real/run*.wav`
-- self-reported `max_gap_ms`: 10 ms; the WAV check stays the authority
-- answer starts 3.4 s after the task result (bridge is deliberately kept until
-  the answer's first PCM exists; this is the M2 tuning knob)
+- **WAV-measured worst acoustic silence: 100 ms** (2.18 s -> 0.50 s -> 0.36 s
+  -> 0.10 s). The residual is one quiet span inside the ack and one piece
+  boundary; the audio is in `tests/voice/out/delegation_real/run*.wav`
+- self-reported `max_gap_ms`: 0 ms; the WAV check stays the authority
+- answer starts ~2.6 s after the task result (bridge audio already queued is
+  allowed to drain; the answer itself jumps the TTS queue)
 
 Automated suite (fake engines, deterministic):
 `short`, `delegation`, `barge_in`, `task_failure`, `es_smoke` all pass,
@@ -220,3 +219,36 @@ the first checker report was a mixed-base artifact (~573 ms ≈ the speech-start
 offset), not audio. The WAV-derived **`eos_to_first_audible_ms`** (first
 10 ms RMS>0.01 in the output WAV minus the last audible frame of the input WAV)
 is the only number comparable across runs, and it is now the headline.
+
+
+## Endpointing dominates the audible number
+
+The pipeline (VAD-declared end -> first audible) is ~250-290 ms. The rest of the
+710 ms is the end-of-turn wait. Measured on the same scenario by varying
+`--vad-min-silence-ms`:
+
+| end-of-turn silence | WAV audible p50 | worst WAV gap |
+|---|---|---|
+| 500 ms (old) | 1050 ms | 100 ms |
+| 250 ms | 830 ms | 100 ms |
+| **150 ms (new default)** | **710 ms** | **100 ms** |
+| 150 ms, before the silence gate | — | 360 ms |
+
+This mirrors HF's choice (Silero `min_silence_ms=64` plus a smart-turn model);
+we have no smart-turn, so 150 ms is the aggressive end for an energy VAD. Going
+lower is the speculative-ack work (M3), not a tuning exercise.
+
+The 100 ms residual is a quiet span inside the ack plus one piece boundary;
+the gate drops quiet runs >220 ms and keeps natural pauses <=150 ms verbatim.
+
+## Final automated result
+
+```
+barge_in         ok   wav_gap=0ms    audible_p50=920ms
+delegation       ok   wav_gap=0ms    audible_p50=900ms
+delegation_real  ok   wav_gap=100ms  audible_p50=710ms  p95=730ms
+es_smoke         ok   wav_gap=0ms    audible_p50=910ms
+short            ok   wav_gap=0ms    audible_p50=920ms
+task_failure     ok   wav_gap=0ms    audible_p50=900ms
+PASS: 6 scenario(s)
+```
