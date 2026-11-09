@@ -67,6 +67,7 @@
 #include "crispasr_consent_record.h"
 #include "crispasr_voice_clone_policy.h"
 #include "crispasr_voice_provenance.h"
+#include "crispasr_voice_reference.h"
 #include "core/crispasr_watermark.h"
 #include "crispasr_watermark_dispatch.h"
 #include "crispasr_watermark_stats.h"
@@ -2825,6 +2826,10 @@ int crispasr_run_backend(const whisper_params& params_in) {
     if (params.align_only) {
         // Resolve aligner model.
         std::string am = params.aligner_model;
+        if (!params.ultra_head.empty() && (am.empty() || am == "auto" || am == "default")) {
+            fprintf(stderr, "crispasr[align-only]: --ultra-head requires an explicit Qwen forced-aligner -am path.\n");
+            return 10;
+        }
         if (am.empty() || am == "auto" || am == "default") {
             am = crispasr_resolve_model_cli(am.empty() ? "auto" : am, "canary-ctc-aligner", params.no_prints,
                                             params.cache_dir, params.auto_download);
@@ -3006,8 +3011,26 @@ int crispasr_run_backend(const whisper_params& params_in) {
         }
 
         // Run alignment.
-        auto aligned = crispasr_align_words(am, transcript, samples.data(), (int)samples.size(), /*t_offset_cs=*/0,
-                                            params.n_threads, nullptr, params.chunk_seconds);
+        std::vector<CrispasrUltraAlignedWord> ultra;
+        std::vector<CrispasrAlignedWord> aligned;
+        if (!params.ultra_head.empty()) {
+            if (!crispasr_align_words_ultra(am, params.ultra_head, transcript, samples.data(), (int)samples.size(),
+                                            params.n_threads, ultra)) {
+                fprintf(stderr, "crispasr[align-only]: Ultra alignment failed (requires Qwen forced aligner, "
+                                "valid local head and audio no longer than 120 seconds).\n");
+                return 10;
+            }
+            for (const auto& word : ultra) {
+                CrispasrAlignedWord converted;
+                converted.text = word.text;
+                converted.t0_cs = static_cast<int64_t>(std::llround(word.start_ms / 10));
+                converted.t1_cs = static_cast<int64_t>(std::llround(word.end_ms / 10));
+                aligned.push_back(std::move(converted));
+            }
+        } else {
+            aligned = crispasr_align_words(am, transcript, samples.data(), (int)samples.size(), /*t_offset_cs=*/0,
+                                           params.n_threads, nullptr, params.chunk_seconds);
+        }
         if (aligned.empty()) {
             fprintf(stderr, "crispasr[align-only]: alignment failed or produced no words.\n");
             return 10;
@@ -3025,6 +3048,24 @@ int crispasr_run_backend(const whisper_params& params_in) {
 
         // Format output.
         const double clip_end = (double)samples.size() / 16000.0;
+        auto word_start = [&](size_t i) {
+            return ultra.empty() ? aligned[i].t0_cs / 100.0 : ultra[i].start_ms / 1000.0;
+        };
+        auto word_end = [&](size_t i) { return ultra.empty() ? aligned[i].t1_cs / 100.0 : ultra[i].end_ms / 1000.0; };
+        auto segment_start = [&](const CrispasrAlignedSegment& segment) {
+            return ultra.empty() ? segment.t0_cs / 100.0 : word_start(segment.word_begin);
+        };
+        auto segment_end = [&](const CrispasrAlignedSegment& segment) {
+            return ultra.empty() ? segment.t1_cs / 100.0 : word_end(segment.word_end - 1);
+        };
+        auto word_json = [&](size_t i) {
+            auto word = core_align_json::word(aligned[i]);
+            if (!ultra.empty()) {
+                word["start"] = word_start(i);
+                word["end"] = word_end(i);
+            }
+            return word.dump();
+        };
         auto ts = [](double s, bool comma) -> std::string {
             if (s < 0)
                 s = 0;
@@ -3048,44 +3089,44 @@ int crispasr_run_backend(const whisper_params& params_in) {
             if (segment_mode) {
                 for (size_t i = 0; i < segments.size(); i++) {
                     const auto& seg = segments[i];
-                    snprintf(num, sizeof(num), "\"start\": %.3f, \"end\": %.3f, \"words\": [", seg.t0_cs / 100.0,
-                             seg.t1_cs / 100.0);
+                    snprintf(num, sizeof(num), "\"start\": %.3f, \"end\": %.3f, \"words\": [", segment_start(seg),
+                             segment_end(seg));
                     out += "  {\"text\": \"" + json_esc(seg.text) + "\", " + num;
                     for (size_t w = seg.word_begin; w < seg.word_end; w++) {
-                        out += std::string(w > seg.word_begin ? ", " : "") + core_align_json::word(aligned[w]).dump();
+                        out += std::string(w > seg.word_begin ? ", " : "") + word_json(w);
                     }
                     out += std::string("]}") + (i + 1 < segments.size() ? "," : "") + "\n";
                 }
             } else {
                 for (size_t i = 0; i < aligned.size(); i++) {
-                    out += "  " + core_align_json::word(aligned[i]).dump() + (i + 1 < aligned.size() ? "," : "") + "\n";
+                    out += "  " + word_json(i) + (i + 1 < aligned.size() ? "," : "") + "\n";
                 }
             }
             out += "]\n";
         } else if (fmt == "plain") {
             if (segment_mode) {
                 for (auto& seg : segments)
-                    out += ts(seg.t0_cs / 100.0, false) + "\t" + seg.text + "\n";
+                    out += ts(segment_start(seg), false) + "\t" + seg.text + "\n";
             } else {
-                for (auto& w : aligned)
-                    out += ts(w.t0_cs / 100.0, false) + "\t" + w.text + "\n";
+                for (size_t i = 0; i < aligned.size(); ++i)
+                    out += ts(word_start(i), false) + "\t" + aligned[i].text + "\n";
             }
         } else { // srt (default)
             if (segment_mode) {
                 for (size_t i = 0; i < segments.size(); i++) {
-                    double t0 = segments[i].t0_cs / 100.0;
-                    double t1 = segments[i].t1_cs / 100.0;
+                    double t0 = segment_start(segments[i]);
+                    double t1 = segment_end(segments[i]);
                     if (t1 <= t0)
-                        t1 = (i + 1 < segments.size()) ? segments[i + 1].t0_cs / 100.0 : clip_end;
+                        t1 = (i + 1 < segments.size()) ? segment_start(segments[i + 1]) : clip_end;
                     out += std::to_string(i + 1) + "\n" + ts(t0, true) + " --> " + ts(t1, true) + "\n" +
                            segments[i].text + "\n\n";
                 }
             } else {
                 for (size_t i = 0; i < aligned.size(); i++) {
-                    double t0 = aligned[i].t0_cs / 100.0;
-                    double t1 = aligned[i].t1_cs / 100.0;
+                    double t0 = word_start(i);
+                    double t1 = word_end(i);
                     if (t1 <= t0)
-                        t1 = (i + 1 < aligned.size()) ? aligned[i + 1].t0_cs / 100.0 : clip_end;
+                        t1 = (i + 1 < aligned.size()) ? word_start(i + 1) : clip_end;
                     out += std::to_string(i + 1) + "\n" + ts(t0, true) + " --> " + ts(t1, true) + "\n" +
                            aligned[i].text + "\n\n";
                 }
@@ -3544,6 +3585,13 @@ int crispasr_run_backend(const whisper_params& params_in) {
     }
 
     warn_unsupported(*backend, params);
+
+    // #584: a bare --voice naming <voice-dir>/<name>.wav becomes that clone
+    // reference (+ <name>.txt as --ref-text) before init and the consent gate,
+    // for cloning backends that do not resolve voice-dir names themselves.
+    if (!params.tts_text.empty() && crispasr_voice::apply_voice_dir_reference(*backend, params) && params.verbose)
+        fprintf(stderr, "crispasr[verbose]: --voice resolved to clone reference '%s'%s\n", params.tts_voice.c_str(),
+                params.tts_ref_text.empty() ? "" : " (+ transcript)");
 
     // A monolingual backend can only ever emit sole_language(); asking it for a
     // different one is not a warning, it is a request it cannot satisfy. Before

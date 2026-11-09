@@ -470,6 +470,15 @@ std::vector<CrispasrAlignedWord> align_wav2vec2_ctc(const std::string& model_pat
 
 } // namespace
 
+// The Qwen3 forced-aligner path is chosen by filename. Upstream names the
+// Ultra checkpoint "Qwen3-ForcedAligner-Ultra" (no hyphen), so accept that
+// spelling too; a miss silently routes to the CTC aligner (#579).
+bool crispasr_aligner_is_qwen3_forced_aligner(const std::string& aligner_model) {
+    return path_contains_ci(aligner_model, "forced-aligner") || path_contains_ci(aligner_model, "forcedaligner") ||
+           path_contains_ci(aligner_model, "forced_aligner") || path_contains_ci(aligner_model, "qwen3-fa") ||
+           path_contains_ci(aligner_model, "qwen3-forced");
+}
+
 std::vector<std::string> crispasr_tokenise_align_words(const std::string& text) {
     return tokenise_words(text);
 }
@@ -699,6 +708,58 @@ std::vector<CrispasrAlignedWord> crispasr_align_words(const std::string& aligner
     return out;
 }
 
+bool crispasr_align_words_ultra(const std::string& aligner_model, const std::string& head_model,
+                                const std::string& transcript, const float* samples, int n_samples, int n_threads,
+                                std::vector<CrispasrUltraAlignedWord>& output) {
+    if (aligner_model.empty() || head_model.empty() || transcript.empty() || !samples || n_samples <= 0 ||
+        n_samples > QWEN3_FA_MAX_CHUNK_SAMPLES || !crispasr_aligner_is_qwen3_forced_aligner(aligner_model))
+        return false;
+    for (int i = 0; i < n_samples; ++i)
+        if (!std::isfinite(samples[i]))
+            return false;
+    try {
+        const auto words = tokenise_words(transcript);
+        const auto display = tokenise_display_words(transcript);
+        if (words.empty() || words.size() > 8192 || display.size() != words.size())
+            return false;
+        std::vector<const char*> pointers;
+        pointers.reserve(words.size());
+        for (const auto& word : words)
+            pointers.push_back(word.c_str());
+        std::vector<double> start(words.size()), end(words.size());
+        std::lock_guard<std::mutex> lock(g_aligner_cache_mtx);
+        if (g_aligner_cache_type != AlignerType::Qwen3FA || g_aligner_cache_path != aligner_model)
+            aligner_cache_free_locked();
+        auto* ctx = static_cast<qwen3_asr_context*>(g_aligner_cache_ctx);
+        if (!ctx) {
+            auto params = qwen3_asr_context_default_params();
+            params.n_threads = n_threads > 0 ? n_threads : 4;
+            params.verbosity = 0;
+            ctx = qwen3_asr_init_from_file(aligner_model.c_str(), params);
+            if (!ctx)
+                return false;
+            g_aligner_cache_ctx = ctx;
+            g_aligner_cache_path = aligner_model;
+            g_aligner_cache_type = AlignerType::Qwen3FA;
+        }
+        if (qwen3_asr_lm_head_dim(ctx) == 0 || qwen3_asr_lm_head_dim(ctx) > 10000) {
+            aligner_cache_free_locked();
+            return false;
+        }
+        if (qwen3_asr_align_words_ultra(ctx, samples, n_samples, pointers.data(), static_cast<int>(words.size()),
+                                        head_model.c_str(), start.data(), end.data()) != 0)
+            return false;
+        std::vector<CrispasrUltraAlignedWord> result;
+        result.reserve(words.size());
+        for (size_t i = 0; i < words.size(); ++i)
+            result.push_back({display[i], start[i], end[i]});
+        output = std::move(result);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 static std::vector<CrispasrAlignedWord> align_words_impl(const std::string& aligner_model,
                                                          const std::string& transcript, const float* samples,
                                                          int n_samples, int64_t t_offset_cs, int n_threads,
@@ -709,9 +770,7 @@ static std::vector<CrispasrAlignedWord> align_words_impl(const std::string& alig
     if (aligner_model.empty() || transcript.empty() || !samples || n_samples <= 0 || chunk_seconds < 0)
         return out;
 
-    const bool is_qwen3_fa = path_contains_ci(aligner_model, "forced-aligner") ||
-                             path_contains_ci(aligner_model, "qwen3-fa") ||
-                             path_contains_ci(aligner_model, "qwen3-forced");
+    const bool is_qwen3_fa = crispasr_aligner_is_qwen3_forced_aligner(aligner_model);
 
     const bool is_wav2vec2 = !is_qwen3_fa && is_wav2vec2_aligner_model(aligner_model, gguf_architecture(aligner_model));
 

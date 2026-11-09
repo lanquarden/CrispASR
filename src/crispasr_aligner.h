@@ -76,6 +76,10 @@ CrispasrAlignmentAudioRange crispasr_alignment_audio_range(int64_t segment_t0_cs
 /// splitter the aligner backends use — callers that map aligned words back
 /// onto larger units (SRT cues, lines) must count with this, not with a
 /// naive space count.
+// True when the aligner model path selects the Qwen3 forced-aligner runtime
+// (filename-based; includes the Ultra base checkpoint's upstream spelling).
+bool crispasr_aligner_is_qwen3_forced_aligner(const std::string& aligner_model);
+
 std::vector<std::string> crispasr_tokenise_align_words(const std::string& text);
 
 /// The same alignment units with punctuation reattached to the neighbouring
@@ -107,7 +111,7 @@ std::vector<CrispasrAlignedSegment> crispasr_group_aligned_segments(const std::v
 /// Run CTC forced alignment.
 ///
 /// Dispatches to canary-ctc-aligner by default, to qwen3-fa when
-/// `aligner_model` filename contains "forced-aligner" / "qwen3-fa" /
+/// `aligner_model` filename contains "forced-aligner" / "forcedaligner" / "qwen3-fa" /
 /// "qwen3-forced", and to wav2vec2/hubert/data2vec CTC when the filename
 /// or GGUF architecture identifies that family. Models load and free inside the call —
 /// cost is dominated by the ASR pass upstream, not the aligner load.
@@ -130,6 +134,19 @@ std::vector<CrispasrAlignedWord> crispasr_align_words(const std::string& aligner
                                                       const float* samples, int n_samples, int64_t t_offset_cs,
                                                       int n_threads, bool* out_load_failed = nullptr,
                                                       int chunk_seconds = 30);
+
+struct CrispasrUltraAlignedWord {
+    std::string text;
+    double start_ms = 0;
+    double end_ms = 0;
+};
+
+// Experimental single-clip Ultra path. Preserves sub-centisecond timing and
+// rejects clips over 120 seconds instead of returning partial alignment. On
+// failure returns false and leaves `output` unchanged.
+bool crispasr_align_words_ultra(const std::string& aligner_model, const std::string& head_model,
+                                const std::string& transcript, const float* samples, int n_samples, int n_threads,
+                                std::vector<CrispasrUltraAlignedWord>& output);
 
 /// Free the cached aligner model context (§176e). Call at shutdown.
 void crispasr_aligner_free_cache();

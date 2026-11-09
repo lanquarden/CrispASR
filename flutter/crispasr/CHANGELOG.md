@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.8.53
+
+* **Packaging:** new `crispasr-linux-x86_64-hip7.tar.gz` for AMD GPUs on ROCm 7.x (hipBLAS `libhipblas.so.3`); the ROCm 6 HIP tarball cannot load its GPU module there (#586).
+
+## 0.8.52
+
+* **Alignment:** Qwen3-ForcedAligner-Ultra F16 GGUF in the model registry; experimental Ultra local-head alignment (#579).
+* **Speech synthesis:** Qwen3-TTS can keep only the codec on Vulkan with the talker on CPU (#585); `--voice-dir` bare names resolve into clone references (#584).
+* **Packaging:** the Linux HIP tarball falls back to CPU when ROCm/hipBLAS is missing (#586).
+
 ## 0.8.51
 
 * **Bindings:** session auto-chunking and duration-proportional token budgets (#574).

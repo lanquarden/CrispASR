@@ -1,20 +1,43 @@
 # CrispASR — Current work plan
 
-Updated 2026-11-03. Start with [the maintainer handoff](docs/maintenance-handoff.md).
+Updated 2026-11-07. Start with [the maintainer handoff](docs/maintenance-handoff.md).
 It contains the completed work, exact evidence, bounded next actions and blockers
 needed by a fresh agent; no earlier chat is required. Follow `AGENTS.md` and its
 mandatory maintainer-guide instructions before implementation.
 
-**v0.8.50 is tagged; its publication is in progress (lanes R1–R3 below). SCNet, Mini-BS-RoFormer, #564 and #567–#570 are on main and in the tag.** Claim work by adding owner,
+**v0.8.51 is published and verified (2026-11-07); v0.8.50 too (lanes R1–R3 complete). Open work: the lanes under NOW (M1 #568 Metal, S1 SCNet follow-ups, V1 optional checks, #577/#579 model work) and the holds.** Claim work by adding owner,
 source SHA, missing behavior, acceptance gates and next action under "NOW"
 before starting. The full scope of each task (exact runs, inputs, commands and
 acceptance) is in [the handoff, "Open tasks"](docs/maintenance-handoff.md#open-tasks--fully-scoped).
 
 ## NOW — open lanes, fully scoped (2026-11-03)
 
+### Model documentation and issues #577/#579 — Codex (2026-11-07)
+
+- Source `0c39103756be95576202985e9972479648b4b5c9`. First document shipped Haas-ja usage and the actual Ultra/RE-USE support boundaries against the registry and runtime. Then review draft PR #580 and continue the pinned Ultra local-head and RE-USE work with unit and original-model parity tests; assess Nemotron 3.5 30B conversion, resource and Q3/Q4 quality feasibility. Preserve the #568 Metal CPU fallback and defer physical Metal work as requested.
+
+### v0.8.51 publication — COMPLETE (2026-11-07)
+
+- Tag `v0.8.51` → `008a771c57fe285e86727c80e155d5376a9ee44b`. Release **42318289402** (58 assets), wrappers 42318289418 and Docker 42318289400 succeeded. Native audit **42334728938** and wheel audit **42360358086** are accepted. Receipts: [native](docs/historical/release-v0851-native-audit-2026-11-07.json), [wheel](docs/historical/release-v0851-wheel-audit-2026-11-07.json).
+- **What blocked PyPI, and the lesson:** the first wheel run, 42334706334, built 10 of 11 wheels and published the GPU index. Its `macos-arm64` job was cancelled at 0 s on both attempts, because GitHub now rejects the `macos-14` runner label. With that wheel missing, `publish-pypi` was skipped, so PyPI stayed at 0.8.50.
+  - A rerun cannot help, because it reuses the workflow file from the original commit.
+  - Fix `06a620d59` moved every `macos-14` runner use to `macos-15`. Then a fresh `workflow_dispatch` of `release-python-wheels.yml` with `tag=v0.8.51` (run **42359206396**) rebuilt and published PyPI and the GPU index from one run, and the audit used that run.
+  - Rule: if a matrix job is cancelled at 0 s with no steps, suspect a rejected runner label, not starvation.
+- Closed #574 with the release link.
+### Issue #579 Ultra local-head port — Codex (2026-11-06)
+
+- Source `fbde4c5f2c8c3a2d52dabf47ae9512aafb7fe61a`. Port the optional head only against the pinned upstream reference, beginning with the posterior-mean decoder and duration/overlap repair. The [CPU reference run](https://github.com/CrispStrobe/CrispASR/actions/runs/42313568853) stores 44 endpoint inputs and logits for a real 22-word clip. The CPU head graph, offset decoder, acoustic features and opt-in hidden-state capture match the captured CPU reference. The pinned sidecar converter round-trips all 28 arrays. [End-to-end CPU parity](https://github.com/CrispStrobe/CrispASR/actions/runs/42320992672) passed on one English clip. The experimental CLI, C ABI and Python interfaces are on main and passed a separate full-model CPU interface audit; broader audio/language coverage, other bindings and GPU acceptance remain open.
+
+### Issue #579 RE-USE native parity — Codex (2026-11-07)
+
+- Source `f169cc3a3`. The four independent ports and their licenses are audited in [the port audit](docs/reuse-port-audit.md). The one-second 71-boundary CPU comparison `issue579-reuse-cpu-diff-v4` passed the native waveform and all phase-conditioned checks but failed native raw phase and intermediate gates; see the [receipt](docs/historical/reuse-one-second-diff-20261107.json). The experimental diff supports one-second windows and enforces row cosine. Optional window and complex-STFT diagnostics and strict raw-phase regression controls passed targeted tests on experimental branch `72203acc2`. The opt-in oneMKL research frontend at `4830b8e22` passes all 71 unconditioned local 100 ms intermediate checks; the integrated one-second run also passed all 71 unconditioned checks and all 71 conditioned checks. Kaggle FFT provenance `issue579-reuse-fft-env-v1` identified an AVX2 oneMKL dispatch versus the local AVX-512 dispatch; locally forcing AVX2 reproduces the captured Kaggle FFT on one clip. The five-excerpt `issue579-reuse-fft-env-v2` probe confirmed exact AVX2 complex spectra; the explicit `mkl-avx2` profile at `3f43acce9` passed all 71 unconditioned checks against the independently captured `issue579-reuse-original-stages-v1` CPU reference. `issue579-reuse-cufft-v1` found direct cuFFT matches Torch GPU spectra on one clip; native CUDA frontend `1d889456a` passed six CTest targets, GPU frontend controls at three lengths, and all 71 unconditioned checks against original unfused CUDA stages in `issue579-reuse-cuda-profile-v2`. The one-second independent Kaggle CPU model reference `issue579-reuse-original-stages-v2` passed all 71 unconditioned and 71 conditioned checks against local `mkl-avx2`. The profile remains experimental. `issue579-reuse-fused-source-v1` passed a compiler-only preflight for pinned original Mamba sources and pinned CUB headers; `issue579-reuse-fused-source-v2` built the original fused extensions with source unchanged, but model capture stopped before inference because the installed Transformers lacks a required legacy import. `issue579-reuse-fused-capture-v2` captured 72 original fused CUDA tensors with 120 calls to each fused extension. `issue579-reuse-cuda-fused-v1` passed all 71 unconditioned and 71 conditioned comparisons against that original fused capture on one 100 ms T4 input. The one-second original fused capture `issue579-reuse-fused-capture-1s-v1` and native full-stage comparison `issue579-reuse-cuda-fused-1s-v1` passed all 71 unconditioned and 71 conditioned checks on a T4. Long recordings, additional devices, speech quality, and a full GPU model backend remain open. The [window/FFT audit](docs/historical/reuse-window-fft-diagnosis-20261107.json) isolates cross-environment FFT differences and rejects exact-Hann substitution as a parity fix; all existing gates remain. The experimental CPU port and `crispasr-diff` stage runner are on `work/issue579-reuse-decoder`; no product backend has shipped. Original unfused Mamba on CUDA and an independent ONNX network agree with the corresponding adapter when given the same spectra, and all 71 conditioned native stage checks pass against the unfused CUDA capture. The default native frontend and unconditioned 100 ms waveform still fail the investigative gate; the upstream raw first-frame phase itself varies between CPU environments. Broader fused CUDA and normal-duration samples, rates, long-file chunking and speech-quality regressions need separate qualification. Continue using [the audit](docs/reuse-reference-audit.md), independent C++/Rust/ONNX ports and explicit source hashes; do not treat short-clip cross-environment instability as proof that portable inference is impossible.
+
 ### Issue #579 model evaluation and release preparation — Codex (2026-11-06)
 
 - Source `b11617ea7d4a6808c0642ff1d0e8c606057d878f`. Evaluate Qwen3-ForcedAligner-Ultra against the existing aligner and RE-USE against its upstream implementation, using pinned checkpoints and independent reference/parity, meaningful unit and end-to-end tests, and hosted resources. Assess #577 and #568 against their documented architectural and physical-hardware gates. Retry the failed Pages deployment; prepare the next patch from the audited main tip, qualify the exact release source, and verify all publishers and release receipts before calling publication complete.
+### Issue #579 Ultra aligner parity — Codex (2026-11-06)
+
+- Source `b11617ea7d4a6808c0642ff1d0e8c606057d878f`. Validate the base Ultra checkpoint through the existing Qwen3 forced-aligner conversion and runtime against the pinned upstream Python implementation, document the reproducible scope and retain comparator controls. The optional local head and broader language/quantization qualification remain separate gates.
 
 ### Capture variants, issue #577 triage, and Metal #568 — Codex (2026-11-06)
 
@@ -79,15 +102,14 @@ Each lane gives the start state, the exact steps, the acceptance and what to do 
   3. Fix it in ggml-metal or in the graph.
 - **Accept:** Metal stems match CPU (vocals RMS within 1 %; SDR on the reporter's synthetic band within 0.5 dB of CPU) for F16/Q8_0/Q4_K. Then remove the CPU fallback, keep the env var as a kill switch, and close #568.
 
-### Lane S1 — SCNet follow-ups (review findings, not blockers)
+### Lane S1 — SCNet follow-ups (status 2026-11-07)
 
-SCNet is on main and in v0.8.50, as a squash of qualified candidate `7b6a88360` (hosted qualification 41520873570, plus the main re-run 41615896059). Docs: `docs/scnet.md`. Open review findings from PR #566, each needing its own small fix and test:
-1. The graph cache likely misses on almost every chunk, because the random per-chunk prefix changes the frame count. Measure the hit rate; if it is low, pad to a fixed frame count or key the cache by shape bucket.
-2. A very short input or tail block aborts the whole separation. Pad or skip short tails, and add a unit test with a 0.1 s input.
-3. The server returns 500 for more than two channels. Return 400 with a message, or downmix.
-4. `crispasr_set_gpu_device_pref` is process-wide. Scope it to the context, as the other backends do.
-5. The server has no input length cap. Add the same cap the other separation endpoints use.
-- **Accept per item:** a unit test or an actual CLI/server reproduction before and after; CI/Lint green. Do not touch the qualified numerics without re-running `scnet-qualification.yml` (dispatch-only, about 1 h, both sizes).
+SCNet is on main (v0.8.50+). Review findings from PR #566:
+1. **Open — graph cache hit rate.** The random per-chunk shift prefix changes the frame count, so the cached graph probably misses on most chunks. Measure it with an actual model (log cache hits in `src/scnet.cpp` graph reuse over a 60 s file). If it misses, bucket the shape (pad the prefix to a fixed frame count). Any numeric change requires a re-run of `scnet-qualification.yml`.
+2. **Fixed and verified** (qualification 42371575575 runs real-model 0.01 s and 100-sample-tail controls). `forward()` no longer aborts on inputs too short for the reflective STFT pad; it zero-extends to `FFT/2+1` samples and trims. Only inputs that previously threw take this path, so qualified results are unchanged. **To verify:** run the CLI `--separate` with an SCNet model on a 0.01 s stereo file, and on a file whose final segment is shorter than 2048 samples (with `--shifts 0`). Both must succeed with finite stems of the input length.
+3. **Not applicable.** The server always interleaves to 2 channels before `scnet_separate`, so the ">2 channels → 500" path cannot occur.
+4. **Won't fix here.** `crispasr_set_gpu_device_pref` is process-wide by design for every backend (Mini-BS-RoFormer does the same). Changing it is a codebase-wide refactor, not an SCNet bug.
+5. **Fixed.** The server separation endpoint (all separators) now returns 400 for empty audio, and 413 above `CRISPASR_SERVER_SEPARATE_MAX_SECONDS` (default 1800; 0 disables).
 
 ### Lane V1 — optional hosted checks for #569 / #570
 

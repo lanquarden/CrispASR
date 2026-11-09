@@ -42,6 +42,7 @@ from ._binding import (
     SpeakerEmbedder,
     agglomerative_cluster,
     align_words,
+    align_words_ultra,
     free_aligner_cache,
     cache_dir,
     cache_ensure_file,
@@ -115,6 +116,7 @@ __all__ = [
     "SpeakerEmbedder",
     "agglomerative_cluster",
     "align_words",
+    "align_words_ultra",
     "free_aligner_cache",
     "cache_dir",
     "cache_ensure_file",
@@ -131,4 +133,4 @@ __all__ = [
     "watermark_embed",
     "watermark_load_model",
 ]
-__version__ = "0.8.51"
+__version__ = "0.8.53"
