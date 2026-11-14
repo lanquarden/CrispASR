@@ -49,6 +49,20 @@ struct SequencerStats {
 bool task_event_is_stale(const Event& e, uint64_t current_gen,
                          uint64_t current_epoch);
 
+// Whether a holding phrase pretends to know something: it names a device or
+// states a condition. "The garage door is still open." is an answer, not a
+// filler, and a small model asked to cover several seconds will produce it. The
+// check is deterministic and lives next to the classifier so the selftest can
+// pin both directions without a model.
+bool filler_claims_result(const std::string& text);
+
+// The fixed bridge guidance the orchestrator puts in the system prompt of every
+// ack/filler/answer request: expected wait from the configured tool latency, and
+// the words needed to cover it at the measured speech rate. Fixed for the whole
+// session on purpose, so it lives in the chat session's cached prefix; the
+// per-call user message only carries what varies (the remaining wait).
+std::string bridge_guidance_text(const Config& cfg);
+
 class SpeechSequencer {
    public:
     SpeechSequencer(const Config& cfg, int sample_rate);
@@ -155,6 +169,9 @@ class SpeechSequencer {
     int llm_filler_speakable_ = 0;   // clauses this generation actually queued
     int64_t task_deadline_ms_ = 0;   // dispatch + task_ms + jitter (upper bound)
     int64_t last_filler_ms_ = 0;
+    // Fillers committed this turn, for --filler-max. Reset where the rest of the
+    // per-turn state is reset.
+    int fillers_queued_turn_ = 0;
     // Speech this turn has committed (ack + filler), from a word estimate, and
     // how much of it has actually been played since the ack started.
     int64_t speech_committed_ms_ = 0;

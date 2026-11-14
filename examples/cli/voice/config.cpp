@@ -332,6 +332,10 @@ bool parse_double(const std::string& v, double* dst) {
 
 bool parse_filler_mode(const std::string& v, Config::FillerMode* dst) {
     std::string s = lower(trim(v));
+    if (s == "none" || s == "off" || s == "silent") {
+        *dst = Config::FillerMode::None;
+        return true;
+    }
     if (s == "bank") { *dst = Config::FillerMode::Bank; return true; }
     if (s == "llm") { *dst = Config::FillerMode::Llm; return true; }
     if (s == "bank_then_llm" || s == "bank,llm" || s == "bankthenllm") {
@@ -500,6 +504,7 @@ const char* cli_usage() {
         "\n"
         "usage: crispasr-voice --harness tests/voice/scenarios/<name>.json [flags]\n"
         "       crispasr-voice --input in.wav --out out.wav [flags]\n"
+        "       crispasr-voice --live [--mic DEV] [--speaker DEV] [flags]\n"
         "\n"
         "models:\n"
         "  --asr-model PATH         ASR GGUF model\n"
@@ -514,10 +519,23 @@ const char* cli_usage() {
         "  --metrics PATH           metrics.jsonl destination\n"
         "  --harness PATH           scenario JSON; runs the automated harness\n"
         "\n"
+        "live session (microphone in, speaker out, one process):\n"
+        "  --live                   run until Ctrl-C; each VAD turn is one turn\n"
+        "  --mic DEV                capture device (arecord -D), default = system\n"
+        "  --speaker DEV            playback device (aplay -D), default = system\n"
+        "  --max-turns N            stop after N completed turns (0 = never)\n"
+        "  --idle-stop-ms N         stop after N ms of silence (0 = never)\n"
+        "  --barge-in               keep the mic open while the assistant speaks\n"
+        "                           (default: half-duplex, ignores its own voice)\n"
+        "  --gate-hangover-ms N     keep the half-duplex gate up N ms after the\n"
+        "                           answer ends, to swallow the speaker tail\n"
+        "                           VOICE_MIC_CMD/VOICE_SPEAKER_CMD override the tools\n"
+        "\n"
         "experiment:\n"
         "  --runs N                 measured runs (warm-up excluded)\n"
         "  --warmup N               warm-up runs, not measured\n"
-        "  --filler MODE            bank | llm | bank_then_llm\n"
+        "  --filler MODE            none | bank | llm | bank_then_llm\n"
+        "  --filler-max N           at most N fillers per turn (0 = policy budget)\n"
         "  --speculate              start the ack on stable partials (M3)\n"
         "  --low-water-ms N         playback low-water mark\n"
         "  --target-water-ms N      target playback depth\n"
@@ -526,6 +544,11 @@ const char* cli_usage() {
         "  --task-ms N              simulated delegation latency\n"
         "  --config PATH            flat key=value (or JSON) defaults file\n"
         "  --selftest               GPU-free policy checks, no audio\n"
+        "  --chat-temperature F     chat sampling temperature (default 0.4)\n"
+        "  --chat-top-p F           chat nucleus sampling (default 0.95)\n"
+        "  --chat-rep-penalty F     chat repetition penalty (default 1.1)\n"
+        "  --chat-seed N            chat seed, -1 = random (default 0)\n"
+        "  --no-filler-guard        speak LLM fillers unfiltered\n"
         "  --help                   this text\n";
 }
 
@@ -593,6 +616,17 @@ Config config_from_args(int argc, char** argv) {
             }
             *dst = (int)iv;
         };
+        auto float_flag = [&](float* dst) {
+            const std::string v = value();
+            char* end = nullptr;
+            const double d = std::strtod(v.c_str(), &end);
+            if (end == v.c_str() || (end && *end != '\0')) {
+                std::fprintf(stderr, "warning: %s expects a number, got '%s'\n",
+                             flag.c_str(), v.c_str());
+                return;
+            }
+            *dst = (float)d;
+        };
 
         if (flag == "--help" || flag == "-h") {
             g_extras.help_requested = true;
@@ -622,6 +656,34 @@ Config config_from_args(int argc, char** argv) {
             g_extras.harness_path = value();
             cfg.harness_path = g_extras.harness_path;
             if (cfg.mode.empty()) cfg.mode = "harness";
+        } else if (flag == "--live") {
+            cfg.live = true;
+            if (cfg.mode.empty()) cfg.mode = "live";
+        } else if (flag == "--mic") {
+            cfg.mic_device = value();
+        } else if (flag == "--speaker") {
+            cfg.speaker_device = value();
+        } else if (flag == "--max-turns") {
+            int_flag(&cfg.max_turns);
+        } else if (flag == "--idle-stop-ms") {
+            int_flag(&cfg.idle_stop_ms);
+        } else if (flag == "--barge-in") {
+            // Keep the microphone open while the assistant speaks. Without echo
+            // cancellation the loop may hear itself; use a headset.
+            cfg.vad_gate_during_playback = false;
+        } else if (flag == "--gate-hangover-ms") {
+            int_flag(&cfg.gate_hangover_ms);
+        } else if (flag == "--chat-temperature") {
+            float_flag(&cfg.chat_temperature);
+        } else if (flag == "--chat-top-p") {
+            float_flag(&cfg.chat_top_p);
+        } else if (flag == "--chat-rep-penalty") {
+            float_flag(&cfg.chat_repeat_penalty);
+        } else if (flag == "--chat-seed") {
+            int_flag(&cfg.chat_seed);
+        } else if (flag == "--no-filler-guard") {
+            // Judge the model itself: speak its text as generated.
+            cfg.filler_guard = false;
         }
         else if (flag == "--runs") {
             int_flag(&cfg.runs);
@@ -633,9 +695,12 @@ Config config_from_args(int argc, char** argv) {
         else if (flag == "--filler") {
             std::string v = value();
             if (!parse_filler_mode(v, &cfg.filler_mode)) {
-                std::fprintf(stderr, "warning: --filler expects bank|llm|bank_then_llm, got '%s'\n",
+                std::fprintf(stderr,
+                             "warning: --filler expects none|bank|llm|bank_then_llm, got '%s'\n",
                              v.c_str());
             }
+        } else if (flag == "--filler-max") {
+            int_flag(&cfg.filler_max_per_turn);
         } else if (flag == "--speculate") {
             bool b = true;
             if (has_inline) parse_bool(inline_val, &b);

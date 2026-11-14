@@ -241,6 +241,47 @@ bool task_event_is_stale(const Event& e, uint64_t current_gen,
     return e.task_gen != current_gen || e.task_epoch != current_epoch;
 }
 
+bool filler_claims_result(const std::string& text) {
+    // Device nouns and condition words. Deliberately no bare "on"/"off": the
+    // bank's "I'm on it." is a good holding phrase, and a device sentence that
+    // uses only "on" also names its device, so the noun catches it.
+    static const char* const kBlocked[] = {
+        "garage",  "door",      "doors",     "light",    "lights",
+        "lamp",    "lamps",     "thermostat", "temperature", "status",
+        "state",   "open",      "opened",    "closed",   "close",
+        "locked",  "unlocked",  "lock",      "alarm",    "enabled",
+        "disabled", "active",   "inactive",  "online",   "offline",
+        "connected", "disconnected", "ready", "idle", "turned",
+    };
+    std::string cur;
+    for (size_t i = 0; i <= text.size(); ++i) {
+        const char c = i < text.size() ? text[i] : ' ';
+        const bool alnum = std::isalnum((unsigned char)c) != 0 || c == '\'';
+        if (alnum) {
+            cur.push_back((char)std::tolower((unsigned char)c));
+            continue;
+        }
+        if (cur.empty()) continue;
+        for (const char* w : kBlocked) {
+            if (cur == w) return true;
+        }
+        cur.clear();
+    }
+    return false;
+}
+
+std::string bridge_guidance_text(const Config& cfg) {
+    if (cfg.task_ms <= 0) return std::string();
+    const int wait_s = std::max(1, cfg.task_ms / 1000);
+    const int words = std::max(4, (int)((int64_t)cfg.task_ms / 325));
+    return " A device check takes about " + std::to_string(wait_s) +
+           " seconds. At " + std::to_string(ms_per_word(cfg)) +
+           " ms per spoken word that is about " + std::to_string(words) +
+           " words of speech: enough to cover the wait without piling up several "
+           "short phrases. The timing and the word budget are known in advance, "
+           "never guess them.";
+}
+
 std::vector<Action> SpeechSequencer::take_actions() {
     auto out = std::move(actions_);
     actions_.clear();
@@ -279,6 +320,7 @@ void SpeechSequencer::on_speech_start(int64_t t_ms) {
     llm_fillers_outstanding_ = 0;
     llm_filler_empty_streak_ = 0;
     llm_filler_speakable_ = 0;
+    fillers_queued_turn_ = 0;
     speech_committed_ms_ = 0;
     play_origin_ms_ = -1;
     played_since_origin_ms_ = 0;
@@ -558,6 +600,16 @@ void SpeechSequencer::maybe_request_filler(const std::string& reason,
                                            int64_t t_ms) {
     (void)reason;
     if (!turn_active()) return;
+    // Silence is a valid answer. Some listeners find a chain of holding phrases
+    // worse than the wait itself, so FillerMode::None keeps the ack and drops
+    // the bridge entirely.
+    if (cfg_.filler_mode == Config::FillerMode::None) return;
+    // Hard ceiling, independent of the bridge budget below: the budget decides
+    // how much speech to keep queued, this decides how many phrases the turn is
+    // allowed to spend. One phrase then quiet is the usual request.
+    if (cfg_.filler_max_per_turn > 0 &&
+        fillers_queued_turn_ >= cfg_.filler_max_per_turn)
+        return;
     if (answer_buffered_) return;  // the answer's PCM exists: stop bridging
     if (task_done_ && !answer_requested_) return;
     // At most two filler generations outstanding, the same depth as the clause
@@ -587,21 +639,37 @@ void SpeechSequencer::maybe_request_filler(const std::string& reason,
         if (queue_bank_filler(t_ms)) return;
         if (cfg_.filler_mode == Config::FillerMode::Bank) return;  // stay silent
     }
-
     // A generation that keeps producing nothing usable must not turn into a
     // request loop; three empty results in a row retire the LLM filler for this
     // turn and leave the bank (if any) as the bridge.
     if (llm_filler_empty_streak_ >= kMaxLlmFillerAttempts) return;
     ++llm_fillers_outstanding_;
     llm_filler_speakable_ = 0;
+    ++fillers_queued_turn_;
     const std::string said = recent_fillers_for_prompt();
+
+    // The model already knows from the cached system prompt what a device check
+    // costs and how many words cover it (bridge_guidance_text). What it cannot
+    // know is how much of that wait is still ahead on this turn, so only the
+    // remainder travels in the per-call prompt.
+    std::string window_hint;
+    if (task_deadline_ms_ > 0) {
+        const int64_t until_result = std::max<int64_t>(0, task_deadline_ms_ - t_ms);
+        if (until_result >= 500) {
+            window_hint = " About " +
+                          std::to_string((until_result + 500) / 1000) +
+                          " seconds of the wait remain.";
+        }
+    }
+
     emit_request(TextKind::Filler,
                  "The user is waiting. You are still checking \"" + transcript_ +
                      "\". Say one short, natural holding phrase that does not "
                      "claim progress or a result, and does not repeat what you "
                      "already said" +
                      (said.empty() ? std::string(".")
-                                   : ": \"" + said + "\"."));
+                                   : ": \"" + said + "\".") +
+                     window_hint);
 }
 
 bool SpeechSequencer::queue_bank_filler(int64_t t_ms) {
@@ -620,6 +688,7 @@ bool SpeechSequencer::queue_bank_filler(int64_t t_ms) {
             s.created_ms = t_ms;
             s.expire_ms = t_ms + 4000;
             ++stats_.fillers_queued;
+            ++fillers_queued_turn_;
             speech_committed_ms_ += estimate_speech_ms(s.text, cfg_);
             clauses_.push_back(std::move(s));
             request_next_clause(t_ms);
@@ -641,6 +710,13 @@ bool SpeechSequencer::accept_filler_text(const std::string& text) {
     const std::string clean = sanitize_for_speech(trim(text));
     if (!plausible_filler(clean)) {
         ++stats_.fillers_repeat_rejected;  // unusable counts as rejected speech
+        return false;
+    }
+    // The result-claim guard is a *runtime* safeguard, not part of the model's
+    // job. With --no-filler-guard it is out of the path entirely, so what the
+    // listener hears is exactly what the LLM wrote.
+    if (cfg_.filler_guard && filler_claims_result(clean)) {
+        ++stats_.fillers_repeat_rejected;
         return false;
     }
     const std::string norm = normalize_phrase(clean);

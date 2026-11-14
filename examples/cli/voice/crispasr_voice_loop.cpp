@@ -389,6 +389,20 @@ int selftest_impl() {
                       PreparedAckBook::Outcome::Miss,
               "spec: a barge-in invalidates the prepared ack");
     }
+    // A holding phrase must not claim a result. The live test's LLM filler said
+    // "The garage door is still open." while the check was still running, so the
+    // guard has to catch device nouns and condition words in both directions
+    // without rejecting the neutral bank phrases it replaces.
+    {
+        check(filler_claims_result("The garage door is still open."),
+              "filler: a device condition is not a holding phrase");
+        check(filler_claims_result("The lights are on now."),
+              "filler: a state claim is rejected");
+        check(!filler_claims_result("One moment, let me check that.") &&
+                  !filler_claims_result("I'm on it.") &&
+                  !filler_claims_result("Bear with me for a few seconds."),
+              "filler: neutral holding phrases stay speakable");
+    }
 
     std::printf("%d failure(s)\n", failures);
     return failures == 0 ? 0 : 1;
@@ -410,11 +424,25 @@ int main(int argc, char** argv) {
     if (!x.harness_path.empty())
         return run_harness(cfg, x.harness_path);
 
+    if (cfg.live) {
+        // One process, many turns: the models load once and the session ends on
+        // Ctrl-C, --max-turns or --idle-stop-ms.
+        Engines e = make_crispasr_engines(cfg);
+        LoopRun r = run_live_session(cfg, e);
+        if (!r.ok) {
+            std::fprintf(stderr, "live session failed: %s\n", r.error.c_str());
+            return 1;
+        }
+        return 0;
+    }
+
     if (x.input_wav.empty() || cfg.out_dir.empty() || cfg.out_dir == ".") {
         std::fprintf(stderr,
                      "usage: crispasr-voice --selftest\n"
                      "       crispasr-voice --harness scenario.json "
                      "[--tool-mode off|llm|fake_valid|fake_invalid]\n"
+                     "       crispasr-voice --live [--mic DEV] [--speaker DEV] "
+                     "[--max-turns N]\n"
                      "       crispasr-voice --input in.wav --out out.wav "
                      "--asr-model ... --tts-model ... --chat-model ...\n");
         return 2;

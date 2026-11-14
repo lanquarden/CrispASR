@@ -90,5 +90,10 @@ struct Engines {
 Engines make_crispasr_engines(const Config& cfg);
 Engines make_fake_engines(const Config& cfg);
 
+// LLM only, for the bench (llm_bench.cpp): the loop always needs all three
+// engines, a measurement of the chat model does not. Returns nullptr on init
+// failure; the caller owns it.
+LlmEngine* make_crispasr_llm(const Config& cfg);
+
 }  // namespace voice
 }  // namespace crispasr

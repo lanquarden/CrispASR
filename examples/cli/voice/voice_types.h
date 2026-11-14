@@ -50,8 +50,13 @@ struct Config {
     int task_fail_percent = 0;
 
     // filler policy
-    enum class FillerMode { Bank, Llm, BankThenLlm };
+    // FillerMode::None exists for listeners who prefer silence to holding
+    // phrases: the ack still fires, then nothing is spoken until the answer.
+    enum class FillerMode { None, Bank, Llm, BankThenLlm };
     FillerMode filler_mode = FillerMode::Bank;
+    // Hard ceiling on fillers per turn, independent of the bridge policy
+    // (0 = the policy's own budget). 1 means "one holding phrase, then quiet".
+    int filler_max_per_turn = 0;
     int filler_bank_size = 12;      // clips pre-rendered at startup
     bool prerender_filler = true;
 
@@ -89,6 +94,29 @@ struct Config {
     std::string input_wav;
     std::string out_wav;
     std::string metrics_path;
+
+    // Chat model sampling. These were hardcoded in the engine (temperature 0.4),
+    // which makes "is the bridge bad because of the prompt or the sampler"
+    // unanswerable. They are knobs now because the bridge experiment sweeps them.
+    // The loop sets one value per session; the eval (--eval-bridge) sweeps them.
+    float chat_temperature = 0.4f;
+    float chat_top_p = 0.95f;
+    float chat_min_p = 0.05f;
+    float chat_repeat_penalty = 1.1f;
+    int chat_seed = 0;  // 0 = fixed (reproducible), -1 = random
+    // Whether the deterministic result-claim guard runs. Off means the LLM's
+    // text is spoken as generated: the honest way to judge the model itself.
+    bool filler_guard = true;
+    bool live = false;
+    std::string mic_device;
+    std::string speaker_device;
+    int idle_stop_ms = 0;  // 0 = run until Ctrl-C
+    int max_turns = 0;     // 0 = unlimited
+    // Live-only: keep the half-duplex gate up this long after the assistant
+    // stops producing audio. The turn is over when the ring drains, but the
+    // speaker still has a pipe/ALSA buffer plus room decay in the air, and that
+    // tail is exactly what came back as a fake new turn in the first live test.
+    int gate_hangover_ms = 400;
 
     void normalise();
 };

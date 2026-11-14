@@ -19,6 +19,23 @@ namespace voice {
 int64_t now_ms();
 int64_t steady_ms();
 
+// A frame source. Two implementations exist: the paced WAV reader used by the
+// harness (identical timing for the machine and the human) and a live
+// microphone. `read` returns samples, 0 for end of stream; `overrun_ms` is
+// pacing honesty and is only meaningful for a file-backed source.
+struct FrameSource {
+    virtual ~FrameSource() {}
+    virtual int read(float* out, int n, int64_t* overrun_ms) = 0;
+    virtual bool eof() const = 0;
+};
+
+// A PCM sink: a WAV file, or a speaker. The sink thread writes through this, so
+// the loop never needs to know which one it is talking to.
+struct AudioOut {
+    virtual ~AudioOut() {}
+    virtual void write(const float* pcm, int n) = 0;
+};
+
 // Single-producer / single-consumer PCM ring (float32 mono). Bounded: a push
 // that would exceed capacity drops the oldest samples and reports it.
 class PcmRing {
@@ -59,12 +76,12 @@ class WavReader {
 };
 
 // Writes 16-bit mono WAV. finish() patches the RIFF sizes.
-class WavWriter {
+class WavWriter : public AudioOut {
    public:
     bool open(const std::string& path, int rate, std::string* err);
-    void write(const float* pcm, int n);
+    void write(const float* pcm, int n) override;
     void finish();
-    ~WavWriter();
+    ~WavWriter() override;
 
    private:
     FILE* f_ = nullptr;
@@ -78,7 +95,7 @@ class WavWriter {
 // wall time, which is what the harness measures against.
 class PacedSink {
    public:
-    PacedSink(PcmRing* ring, WavWriter* writer, int sample_rate, int frame_samples);
+    PacedSink(PcmRing* ring, AudioOut* out, int sample_rate, int frame_samples);
     // Runs until stop() is called. Calls on_starved(absent_ms) whenever a frame
     // could not be filled. Returns after stop.
     void run(const std::function<void(int64_t)>& on_starved);
@@ -91,7 +108,7 @@ class PacedSink {
 
    private:
     PcmRing* ring_;
-    WavWriter* writer_;
+    AudioOut* out_;
     int rate_, frame_;
     std::atomic<bool> running_{true};
     std::atomic<int64_t> played_{0};       // includes silence
@@ -100,12 +117,12 @@ class PacedSink {
 
 // Input pacing: reads a frame every frame_ms from wall clock, sleeping as
 // needed. Honest about overruns: reports them via on_overrun.
-class PacedSource {
+class PacedSource : public FrameSource {
    public:
     PacedSource(WavReader* reader, int sample_rate, int frame_samples);
     // Returns samples read (0 at EOF). Sleeps to keep real-time pace.
-    int read(float* out, int n, int64_t* overrun_ms);
-    bool eof() const;
+    int read(float* out, int n, int64_t* overrun_ms) override;
+    bool eof() const override;
 
    private:
     WavReader* reader_;

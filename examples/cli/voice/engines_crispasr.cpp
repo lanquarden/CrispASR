@@ -645,7 +645,11 @@ class CrispasrLlmEngine : public LlmEngine {
         crispasr_chat_generate_params gp;
         crispasr_chat_generate_params_default(&gp);
         gp.max_tokens = max_tokens;
-        gp.temperature = 0.4f;
+        gp.temperature = cfg_.chat_temperature;
+        gp.top_p = cfg_.chat_top_p;
+        gp.min_p = cfg_.chat_min_p;
+        gp.repeat_penalty = cfg_.chat_repeat_penalty;
+        gp.seed = cfg_.chat_seed < 0 ? 0xFFFFFFFFu : (uint32_t)cfg_.chat_seed;
 
         struct Ctx {
             CrispasrLlmEngine* self;
@@ -673,6 +677,7 @@ class CrispasrLlmEngine : public LlmEngine {
     }
 
     void request_abort() override { abort_.store(true); }
+
     bool ready() const override { return session_ != nullptr; }
     const std::string& last_error() const { return last_error_; }
 
@@ -702,6 +707,12 @@ Engines make_crispasr_engines(const Config& cfg) {
     e.llm = llm.release();
     e.owns = true;
     return e;
+}
+
+LlmEngine* make_crispasr_llm(const Config& cfg) {
+    auto llm = std::make_unique<CrispasrLlmEngine>(cfg);
+    if (!llm->init()) return nullptr;
+    return llm.release();
 }
 
 }  // namespace voice

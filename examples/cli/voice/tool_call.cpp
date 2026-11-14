@@ -623,6 +623,28 @@ std::string fake_tool_reply(ToolMode mode, const std::string& transcript) {
     return "{\"tool\":\"device_status\",\"args\":{\"device\":\"garage\"}}";
 }
 
+// The simulated result text. A real deployment's A2A agent returns the device
+// status here; the simulation returned "done: <request>", which gave the answer
+// prompt nothing to answer - measured live as the model replying "I'm checking
+// on the garage door now." *after* the check finished. Answer quality cannot be
+// measured against an input that contains no fact, so the simulation now reports
+// one. Deterministic per device on purpose: the harness scenarios compare runs.
+std::string tool_task_result(const ToolCall& call) {
+    switch (call.tool) {
+        case ToolId::DeviceStatus:
+            if (call.device == "garage") return "the garage door is closed and locked";
+            if (call.device == "lights") return "the living room lights are off";
+            if (call.device == "thermostat") return "the thermostat is set to 21 degrees";
+            return "the device is reachable";
+        case ToolId::SetTimer:
+            return "the timer is set for " + std::to_string(call.minutes) + " minutes";
+        case ToolId::Smalltalk:
+            return std::string();  // no task, no result
+        default:
+            return std::string();
+    }
+}
+
 std::string tool_task_request(const ToolCall& call, const std::string& transcript) {
     switch (call.tool) {
         case ToolId::DeviceStatus:
@@ -702,8 +724,21 @@ int ToolDispatcher::dispatch(const ToolCall& call, const std::string& transcript
     if (impl_ == nullptr) return 0;
     const int slot = Impl::slot(call.tool);
     if (impl_->adapters[slot] == nullptr) return 0;
-    const int local = impl_->adapters[slot]->dispatch(
-        tool_task_request(call, transcript), std::move(cb));
+    // The simulated adapter reports "done: <request>"; swap in the outcome a real
+    // agent would return, so the answer prompt carries a fact. Cancelled and
+    // failed outcomes keep the adapter's text: those paths are about honesty,
+    // and their text is never spoken as an answer.
+    TaskCallback wrapped = [cb, call](const TaskOutcome& o) {
+        TaskOutcome out = o;
+        if (!out.cancelled && out.ok) {
+            const std::string result = tool_task_result(call);
+            if (!result.empty()) out.text = result;
+        }
+        if (cb) cb(out);
+    };
+    const int local =
+        impl_->adapters[slot]->dispatch(tool_task_request(call, transcript),
+                                       std::move(wrapped));
     if (local <= 0) return 0;
     // Global id: local ids restart at 1 per adapter, and tool ids are encoded
     // in the low three bits so cancel() needs no map in the orchestrator.

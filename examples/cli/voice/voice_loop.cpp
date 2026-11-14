@@ -7,6 +7,7 @@
 
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <signal.h>
 
 #include <algorithm>
 #include <atomic>
@@ -23,6 +24,7 @@
 
 #include "arbiter.h"
 #include "audio_io.h"
+#include "audio_live.h"
 #include "sequencer.h"
 #include "speculation.h"
 #include "stt_driver.h"
@@ -40,6 +42,13 @@ Engines::~Engines() {
         delete llm;
     }
 }
+
+namespace {
+
+// Set by the CLI's SIGINT handler; read once per frame by run_session.
+std::atomic<bool> g_stop{false};
+
+}  // namespace
 
 namespace {
 
@@ -206,8 +215,16 @@ void write_timeline(const std::string& path) {
 
 }  // namespace
 
-LoopRun run_once(const Config& cfg_in, Engines& engines,
-                 const std::string& input_wav, const std::string& out_wav) {
+namespace {
+
+// Session orchestrator. `source`/`out` are a paced WAV pair (run_once) or a
+// microphone and a speaker (run_live_session); everything else is identical, so
+// a live session is measured by the same code path the harness scores.
+// `live` switches the turn lifecycle: a file has one turn and ends at EOF, a
+// live session ends its turns at the VAD and keeps listening. `stop` is the
+// Ctrl-C flag the CLI installs.
+LoopRun run_session(const Config& cfg_in, Engines& engines, FrameSource& source,
+                    AudioOut* out, bool live, const std::atomic<bool>* stop) {
     LoopRun run;
     Config cfg = cfg_in;
     cfg.normalise();
@@ -225,23 +242,20 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
     const int frame = cfg.frame_samples;
 
     // The timeline trace is process-wide (the harness stamps the run number and
-    // copies the rows after each run); one call to run_once is one run's worth.
+    // copies the rows after each run); one call to run_session is one run's worth.
     timeline_trace().clear_rows();
 
-    WavReader reader;
-    std::string err;
-    if (!reader.open(input_wav, rate, &err)) {
-        run.error = "input: " + err;
-        return run;
-    }
-    WavWriter writer;
-    if (!writer.open(out_wav, rate, &err)) {
-        run.error = "output: " + err;
-        return run;
-    }
+    // Live sessions talk to a person, so the transcript and the turn summary go
+    // to the terminal by default; VOICE_LIVE_QUIET keeps only the metrics files.
+    const bool live_log = live && std::getenv("VOICE_LIVE_QUIET") == nullptr;
+    auto live_say = [live_log](const char* prefix, const std::string& text) {
+        if (!live_log) return;
+        std::printf("%s%s\n", prefix, text.c_str());
+        std::fflush(stdout);
+    };
 
     PcmRing ring(rate * 12);  // room for queued clauses + fillers; never drop
-    PacedSink sink(&ring, &writer, rate, frame);
+    PacedSink sink(&ring, out, rate, frame);
     SpeechSequencer seq(cfg, rate);
     SttDriver stt(rate, cfg.stt_window_ms, cfg.max_turn_ms);
     TurnDetector detector(rate, cfg.vad_min_speech_ms, cfg.vad_min_silence_ms,
@@ -271,6 +285,11 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
 
     const int64_t t0 = steady_ms();
     int64_t first_played_ack = 0, first_played_answer = 0;
+    // Live-session bookkeeping: how many turns have finished, and when the last
+    // one did (the idle timer measures silence from the end of a turn, not from
+    // process start).
+    int turns_done = 0;
+    int64_t last_turn_end_ms = t0;
     std::string ack_buf, answer_buf;
     bool answer_pcm_dropped_fillers = false;
     int64_t current_task_id = 0;
@@ -350,6 +369,14 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
 
     const std::string lang_rule =
         cfg.language == "es" ? " Responde siempre en español." : std::string();
+    // Fixed guidance, identical for every call in the session, so it sits in the
+    // cached prefix of the chat session's KV cache (crispasr_chat.h: the session
+    // decodes only what is new). The expected wait and the words needed to cover
+    // it are facts about the configured tools, not about this turn, so they
+    // belong here rather than in the per-call prompt. ~325 ms per English word
+    // is the measured qwen3-tts rate (sequencer kMsPerWord).
+    // Shared with the bench (sequencer.cpp) so a measurement matches the loop.
+    const std::string bridge_guidance = bridge_guidance_text(cfg);
     // The ack system prompt is shared by the committed path (pump_llm) and the
     // speculative one (spec_attempt): a prepared ack has to answer exactly the
     // question the ack it replaces would have answered. The user half of the
@@ -362,7 +389,7 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
                    "you are checking. Never mention \"the user\" or restate the "
                    "request in the third person. No quotation marks, no markdown. "
                    "Never state a result you do not have.") +
-               lang_rule;
+               bridge_guidance + lang_rule;
     };
     std::function<void()> pump_llm = [&] {
         PendingText item;
@@ -385,15 +412,42 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
             if (kind == TextKind::Ack) {
                 sys.content = ack_system_prompt();
             } else if (kind == TextKind::Filler) {
+                // The few-shot block is the whole fix. Measured with
+                // --eval-bridge on Qwen3-0.6B, 10 samples per temperature:
+                //   bare instruction, transcript in the user turn : 0% clean
+                //   instruction + guidance in the system prompt    : 70-100%
+                //   three example phrases in the system prompt     : 100%
+                //     at t=0.0, 0.4 and 0.8, ~8 words, TTFT 5 ms
+                // The examples describe the shape instead of listing what not
+                // to say (an explicit ban list measured identically to the
+                // examples alone, so it is not carried). Being static, the block
+                // lives in the session's cached prefix and costs no latency.
                 sys.content =
-                    "You are a voice assistant. Say one short, natural holding "
-                    "phrase. Do not claim progress or a result. Do not repeat "
-                    "yourself." + lang_rule;
+                    std::string(
+                        "You are a voice assistant. While a check runs, reply "
+                        "with ONE natural holding phrase in first person. "
+                        "Good holding phrases: \"Let me take a proper look at "
+                        "that.\" / \"I'm checking on that now, one moment.\" / "
+                        "\"Give me a few seconds to confirm.\" A holding phrase "
+                        "never names a device, never says open or closed, never "
+                        "states a result, and does not repeat what you already "
+                        "said. No quotation marks, no markdown.") +
+                    bridge_guidance + lang_rule;
             } else {
+                // The check is over when this runs, so the model must not offer
+                // to continue it: measured with the result as the only new fact,
+                // 0.6B appended "so I'll check it again" to a correct answer and
+                // 1.7B added "I'll let you know once I have more information".
+                // Both contradict a finished check; the prompt now says so.
                 sys.content =
-                    "You are a voice assistant. Answer in one or two short spoken "
-                    "sentences, continuing naturally from what you already said. "
-                    "No quotation marks, no markdown." + lang_rule;
+                    std::string(
+                        "You are a voice assistant. The check has finished. State "
+                        "what the result is in one short spoken sentence, "
+                        "continuing naturally from what you already said. Do not "
+                        "offer to check again, do not promise to get back to the "
+                        "user, and do not ask a question. No quotation marks, no "
+                        "markdown.") +
+                    lang_rule;
             }
             ChatMessage user;
             user.role = "user";
@@ -421,6 +475,12 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
             const int max_tokens = kind == TextKind::Answer
                                        ? cfg.answer_max_clause_tokens
                                        : 64;
+            // What was actually asked: the LLM harness is the thing under
+            // experiment, and a prompt is only reviewable if it is visible.
+            if (std::getenv("VOICE_DEBUG"))
+                std::fprintf(stderr,
+                             "[dbg] llm request kind=%s max_tokens=%d\n  user: %.400s\n",
+                             to_string(kind), max_tokens, prompt.c_str());
             engines.llm->generate(msgs, max_tokens, on_token, std::string());
             const int64_t finished = steady_ms();
             {
@@ -958,16 +1018,40 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
                         mf << metrics_json(run.metrics) << "\n";
                     }
                     run.ok = true;
+                    if (live) {
+                        // One line per turn: what was heard, and where the
+                        // time went. "First audible" is the ack, which is what
+                        // the listener perceives as the response starting; the
+                        // answer lands after the task completes. The session
+                        // continues; the next speech start opens turn N+1 in
+                        // the same process.
+                        ++turns_done;
+                        last_turn_end_ms = steady_ms();
+                        const int64_t first_audible =
+                            m.ack_first_played_ms > 0 ? m.ack_first_played_ms
+                                                      : m.answer_first_played_ms;
+                        const int64_t eos = m.speech_end_ms;
+                        live_say("[turn] ",
+                                 "eos_to_first_audible=" +
+                                     std::to_string(first_audible > 0
+                                                        ? first_audible - eos
+                                                        : -1) +
+                                     "ms answer_at=" +
+                                     std::to_string(m.answer_first_played_ms) +
+                                     "ms gaps=" + std::to_string(m.gaps.size()) +
+                                     " fillers=" +
+                                     std::to_string(m.fillers_played));
+                    }
                     break;
                 }
             }
         }
     };
 
-    PacedSource source(&reader, rate, frame);
     std::vector<float> frame_buf((size_t)frame);
     int64_t last_partial_ms = 0, last_tick_ms = 0, last_event_ms = steady_ms();
     int64_t last_playback_trace_ms = 0;
+    int64_t last_assistant_audio_ms = 0;  // half-duplex gate hangover
     bool speech_final_posted = false;
     bool at_eof = false;
     bool barge_done = false;
@@ -977,6 +1061,10 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
     while (true) {
         const int n = source.read(frame_buf.data(), frame, nullptr);
         const int64_t now = steady_ms();
+
+        // Ctrl-C: leave the loop, then let the playback thread and the engines
+        // shut down in the order the tail of this function already enforces.
+        if (stop && stop->load()) break;
 
         // Harness barge-in marker (VOICE_BARGE_IN_AT_MS). Checked every tick,
         // including after the input WAV has ended: a barge-in does not need
@@ -990,6 +1078,9 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
         }
 
         if (n <= 0) {
+            if (live && !at_eof)
+                std::fprintf(stderr,
+                             "[live] microphone stream ended; finishing the turn\n");
             if (detector.speech_active() && !speech_final_posted) {
                 speech_final_posted = true;
                 std::vector<float> audio = stt.final_audio();
@@ -1058,6 +1149,34 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
                 events.post(std::move(e));
             };
             const bool floor = seq.turn_active() || ring.buffer_ms(rate) > 0;
+            // Half-duplex guard (live sessions only). While the assistant owns
+            // the floor, an open microphone in a room hears the speaker, and the
+            // loop happily transcribes its own voice and barges in on itself -
+            // which is exactly what happened in the first live test. Feeding the
+            // detector silence keeps its hysteresis and its re-arm logic honest
+            // without letting the output become input. Barge-in on real
+            // interruptions is still available with --barge-in (headset
+            // recommended), or by turning off vad_gate_during_playback.
+            //
+            // The condition must be "the assistant is producing audio", not the
+            // detector's `floor` flag: floor is also true for the whole of the
+            // user's own turn (Listening), and gating on it truncated every
+            // utterance to its first VAD confirmation window.
+            const bool assistant_speaking =
+                ring.available() > 0 || tts_busy.load() ||
+                seq.state() == TurnState::Delegating ||
+                seq.state() == TurnState::Answering;
+            // The ring drains before the speaker does: aplay still holds its
+            // buffer and the room is still ringing when the turn reports done.
+            // The hangover keeps the gate up long enough that the tail cannot
+            // become the next turn's transcript.
+            if (assistant_speaking) last_assistant_audio_ms = now;
+            const bool gate_hangover =
+                cfg.gate_hangover_ms > 0 &&
+                now - last_assistant_audio_ms < cfg.gate_hangover_ms;
+            if (live && cfg.vad_gate_during_playback &&
+                (assistant_speaking || gate_hangover))
+                std::fill(frame_buf.begin(), frame_buf.end(), 0.0f);
             detector.push(frame_buf.data(), n, now, floor, te);
             if (std::getenv("VOICE_DEBUG")) {
                 static int dbg = 0;
@@ -1107,6 +1226,16 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
                     // A new speech segment: anything pre-rendered for the
                     // previous turn (or for a barge-in) is gone, and the
                     // stability rule starts from an empty history.
+                    //
+                    // The accumulated text and the first-played latches belong
+                    // to one turn. In file mode a process is one turn, so they
+                    // were never cleared; in a live session they would grow
+                    // across turns and report (and log) the previous answer as
+                    // part of the new one.
+                    ack_buf.clear();
+                    answer_buf.clear();
+                    first_played_ack = 0;
+                    first_played_answer = 0;
                     previous_partial.clear();
                     spec_reset();
                     spec_sync_metrics();
@@ -1126,6 +1255,10 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
                                      e.text.c_str(), (int)seq.state());
                     seq.metrics().stt_final_cost_ms = e.aux2;
                     seq.metrics().transcript = e.text;
+                    if (live)
+                        live_say("you> ",
+                                 e.text.empty() ? std::string("(nothing heard)")
+                                                : e.text);
                     seq.on_final(e.text, e.t_ms);
                     // M3: commit the prepared ack. A hit is the only path that
                     // pushes pre-rendered audio, and commit() is the prefix +
@@ -1304,8 +1437,10 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
                             seq.metrics().llm_ttft_ms, e.aux2);
                         if ((TextKind)e.aux3 == TextKind::Ack)
                             seq.metrics().ack_text = ack_buf;
-                        if ((TextKind)e.aux3 == TextKind::Answer)
+                        if ((TextKind)e.aux3 == TextKind::Answer) {
                             seq.metrics().answer_text = answer_buf;
+                            if (live) live_say("bot> ", answer_buf);
+                        }
                         seq.on_text_done((TextKind)e.aux3, e.t_ms);
                         pump_llm();
                     } else if (e.aux == kTtsDone) {
@@ -1351,9 +1486,26 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
 
         // Decide after draining events and executing their actions: a finished
         // ASR job may have queued the final transcript this very iteration.
-        if (at_eof && seq.state() == TurnState::Idle && ring.available() == 0 &&
-            !tts_busy && !llm_busy && !tool_busy && work_in_flight.load() == 0)
-            break;
+        const bool quiescent = seq.state() == TurnState::Idle &&
+                               ring.available() == 0 && !tts_busy && !llm_busy &&
+                               !tool_busy && work_in_flight.load() == 0;
+        if (quiescent) {
+            // at_eof covers both the WAV path and a live capture device that
+            // died: finish the turn in flight, then stop.
+            if (at_eof) break;
+            // A live session otherwise ends on request, never on silence: an
+            // empty room is just a quiet room unless --idle-stop-ms says
+            // otherwise.
+            if (live) {
+                if (cfg.max_turns > 0 && turns_done >= cfg.max_turns) break;
+                if (cfg.idle_stop_ms > 0 &&
+                    now - last_turn_end_ms >= cfg.idle_stop_ms) {
+                    if (live_log)
+                        std::printf("[live] idle for %d ms, stopping\n", cfg.idle_stop_ms);
+                    break;
+                }
+            }
+        }
 
         if (now - last_tick_ms >= 20) {
             last_tick_ms = now;
@@ -1422,7 +1574,6 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
 
     sink.stop();
     playback.join();
-    writer.finish();
     tools.shutdown();
     arbiter.stop();
 
@@ -1432,6 +1583,71 @@ LoopRun run_once(const Config& cfg_in, Engines& engines,
 
     // run.ok is set only by a FinishTurn action: a turn that never completed
     // is reported as a failure instead of being masked.
+    return run;
+}
+
+}  // namespace
+
+LoopRun run_once(const Config& cfg_in, Engines& engines,
+                 const std::string& input_wav, const std::string& out_wav) {
+    LoopRun run;
+    Config cfg = cfg_in;
+    cfg.normalise();
+
+    WavReader reader;
+    std::string err;
+    if (!reader.open(input_wav, cfg.sample_rate, &err)) {
+        run.error = "input: " + err;
+        return run;
+    }
+    WavWriter writer;
+    if (!writer.open(out_wav, cfg.sample_rate, &err)) {
+        run.error = "output: " + err;
+        return run;
+    }
+
+    PacedSource source(&reader, cfg.sample_rate, cfg.frame_samples);
+    run = run_session(cfg, engines, source, &writer, false, nullptr);
+    writer.finish();
+    return run;
+}
+
+LoopRun run_live_session(const Config& cfg, Engines& engines) {
+    LoopRun run;
+    std::string err;
+    const int rate = cfg.sample_rate > 0 ? cfg.sample_rate : 16000;
+
+    LiveMicSource mic;
+    if (!mic.open(cfg.mic_device, rate, cfg.frame_samples, &err)) {
+        run.error = "mic: " + err;
+        return run;
+    }
+    LiveSpeakerSink speaker;
+    if (!speaker.open(cfg.speaker_device, rate, cfg.frame_samples, &err)) {
+        run.error = "speaker: " + err;
+        return run;
+    }
+
+    // Ctrl-C ends the session; the handler only sets a flag, because the loop
+    // owns every other piece of state (and the engines are not signal-safe).
+    g_stop.store(false);
+    struct sigaction sa = {};
+    sa.sa_handler = [](int) { g_stop.store(true); };
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+
+    std::printf("[live] mic: %s\n[live] speaker: %s\n",
+                mic_command(cfg.mic_device, rate).c_str(),
+                speaker_command(cfg.speaker_device, rate).c_str());
+    std::printf("[live] listening. Ctrl-C to stop.\n");
+    std::fflush(stdout);
+
+    run = run_session(cfg, engines, mic, &speaker, true, &g_stop);
+
+    signal(SIGINT, SIG_DFL);
+    signal(SIGTERM, SIG_DFL);
+    if (cfg.out_dir != "." && run.ok)
+        std::printf("[live] metrics: %s/metrics.jsonl\n", cfg.out_dir.c_str());
     return run;
 }
 

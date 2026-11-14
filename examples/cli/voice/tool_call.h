@@ -81,6 +81,10 @@ std::string fake_tool_reply(ToolMode mode, const std::string& transcript);
 // phrase the completed action, which is what the answer prompt quotes.
 std::string tool_task_request(const ToolCall& call, const std::string& transcript);
 
+// The simulated outcome text for a tool call. Stands in for the status a real
+// agent would return, so the answer prompt is given a fact to speak.
+std::string tool_task_result(const ToolCall& call);
+
 // ---------------------------------------------------------------------------
 // Per-tool latency/failure profile. device_status uses the configured 6 s task
 // (with its jitter and failure injection); set_timer answers in 0-1 s;

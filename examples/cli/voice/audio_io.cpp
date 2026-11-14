@@ -436,8 +436,8 @@ WavWriter::~WavWriter() {
 // actually came out of the ring, which is what distinguishes "the loop kept
 // talking" from "the loop kept emitting silence".
 // ---------------------------------------------------------------------------
-PacedSink::PacedSink(PcmRing* ring, WavWriter* writer, int sample_rate, int frame_samples)
-    : ring_(ring), writer_(writer), rate_(sample_rate > 0 ? sample_rate : 16000),
+PacedSink::PacedSink(PcmRing* ring, AudioOut* out, int sample_rate, int frame_samples)
+    : ring_(ring), out_(out), rate_(sample_rate > 0 ? sample_rate : 16000),
       frame_(frame_samples > 0 ? frame_samples : 1) {}
 
 void PacedSink::run(const std::function<void(int64_t)>& on_starved) {
@@ -458,7 +458,7 @@ void PacedSink::run(const std::function<void(int64_t)>& on_starved) {
             std::fill(buf.begin() + got, buf.end(), 0.0f);
             if (on_starved) on_starved(missing_ms);
         }
-        if (writer_) writer_->write(buf.data(), frame_);
+        if (out_) out_->write(buf.data(), frame_);
         // played_ counts everything emitted (silence included) so the timeline is
         // honest; real_played_ counts only samples that came out of the ring.
         played_.store(played_.load() + frame_);
