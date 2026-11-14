@@ -15,6 +15,7 @@
 #include "config.h"
 #include "engines.h"
 #include "harness.h"
+#include "llm_bench.h"
 #include "sequencer.h"
 #include "speculation.h"
 #include "tool_call.h"
@@ -421,6 +422,24 @@ int main(int argc, char** argv) {
     const CliExtras& x = config_extras();
     if (cfg.mode == "selftest")
         return selftest_impl();
+    if (cfg.mode == "bench-llm") {
+        // Chat model only: TTFT / decode throughput per call site, no audio.
+        return run_llm_bench(cfg);
+    }
+    if (cfg.mode == "eval-bridge") {
+        // Holding-phrase quality sweep: prompts x sampling, raw model output.
+        return run_bridge_eval(cfg);
+    }
+    if (cfg.mode == "bench-context") {
+        // TTFT cost of a dynamic context block (home snapshot) behind a static
+        // system prompt.
+        return run_context_bench(cfg, x.context_file);
+    }
+    if (cfg.mode == "bench-prefill") {
+        // Can the transcript-independent context be prefilled before the
+        // transcript exists, and how much TTFT does that save?
+        return run_prefill_bench(cfg, x.context_file);
+    }
     if (!x.harness_path.empty())
         return run_harness(cfg, x.harness_path);
 
@@ -439,6 +458,8 @@ int main(int argc, char** argv) {
     if (x.input_wav.empty() || cfg.out_dir.empty() || cfg.out_dir == ".") {
         std::fprintf(stderr,
                      "usage: crispasr-voice --selftest\n"
+                     "       crispasr-voice --bench-llm --chat-model PATH "
+                     "[--reps N]\n"
                      "       crispasr-voice --harness scenario.json "
                      "[--tool-mode off|llm|fake_valid|fake_invalid]\n"
                      "       crispasr-voice --live [--mic DEV] [--speaker DEV] "

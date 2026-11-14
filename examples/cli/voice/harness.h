@@ -73,6 +73,7 @@ struct CliExtras {
     std::string input_wav;     // --input
     std::string harness_path;  // --harness
     std::string metrics_path;  // --metrics
+    std::string context_file;  // --context-file (context bench)
     bool help_requested = false;
     // Scenario files carry their own runs/warmup/task_ms; an explicit flag
     // overrides the scenario instead of being overridden by it.

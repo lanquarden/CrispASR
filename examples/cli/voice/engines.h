@@ -73,6 +73,15 @@ class LlmEngine {
     virtual LlmResult generate(const std::vector<ChatMessage>& messages,
                                int max_tokens, TokenCallback on_token,
                                const std::string& grammar = std::string()) = 0;
+    // Prefill without generating: decode the prompt into the KV cache and stop.
+    // Used to move work off the critical path — the home snapshot is known the
+    // moment speech starts, so it can be in the cache before the transcript
+    // exists, and the later generate() then only pays for the transcript.
+    // Returns false when the backend has no prefill-only path.
+    virtual bool prefill(const std::vector<ChatMessage>& messages) {
+        (void)messages;
+        return false;
+    }
     virtual void request_abort() = 0;
     virtual bool ready() const = 0;
 };

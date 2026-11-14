@@ -678,6 +678,32 @@ class CrispasrLlmEngine : public LlmEngine {
 
     void request_abort() override { abort_.store(true); }
 
+    // Decode the prompt into the KV cache and stop. crispasr_chat's own
+    // prefill_only flag exists for exactly this, so the later generate() with the
+    // same messages returns after decoding only what came after the shared
+    // prefix.
+    bool prefill(const std::vector<ChatMessage>& messages) override {
+        if (!session_) return false;
+        abort_.store(false);
+        std::vector<crispasr_chat_message> msgs;
+        msgs.reserve(messages.size());
+        for (auto& m : messages)
+            msgs.push_back({m.role.c_str(), m.content.c_str()});
+
+        crispasr_chat_generate_params gp;
+        crispasr_chat_generate_params_default(&gp);
+        gp.max_tokens = 1;
+        gp.temperature = 0.0f;
+        gp.prefill_only = true;
+
+        // Swallow any token: prefill_only should not emit one, and a backend
+        // that does emit must not write into a dead callback.
+        auto token_cb = [](const char*, void*) {};
+        crispasr_chat_error err{};
+        const int32_t rc = crispasr_chat_generate_stream(
+            session_, msgs.data(), msgs.size(), &gp, token_cb, nullptr, &err);
+        return rc == 0;
+    }
     bool ready() const override { return session_ != nullptr; }
     const std::string& last_error() const { return last_error_; }
 

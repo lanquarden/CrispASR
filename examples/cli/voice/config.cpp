@@ -544,6 +544,12 @@ const char* cli_usage() {
         "  --task-ms N              simulated delegation latency\n"
         "  --config PATH            flat key=value (or JSON) defaults file\n"
         "  --selftest               GPU-free policy checks, no audio\n"
+        "  --bench-llm              chat-model only: TTFT / decode per call site\n"
+        "  --eval-bridge            holding-phrase quality sweep: prompts x sampling\n"
+        "  --bench-context          TTFT cost of a dynamic context block\n"
+        "  --bench-prefill          TTFT with the context prefetched at speech onset\n"
+        "  --context-file PATH      text block to sweep (e.g. a home-state dump)\n"
+        "  --chat-ctx N             chat context window in tokens (default 2048)\n"
         "  --chat-temperature F     chat sampling temperature (default 0.4)\n"
         "  --chat-top-p F           chat nucleus sampling (default 0.95)\n"
         "  --chat-rep-penalty F     chat repetition penalty (default 1.1)\n"
@@ -634,6 +640,14 @@ Config config_from_args(int argc, char** argv) {
             (void)value();  // already handled
         } else if (flag == "--selftest") {
             cfg.mode = "selftest";
+        } else if (flag == "--bench-llm") {
+            cfg.mode = "bench-llm";
+        } else if (flag == "--eval-bridge") {
+            cfg.mode = "eval-bridge";
+        } else if (flag == "--bench-context") {
+            cfg.mode = "bench-context";
+        } else if (flag == "--bench-prefill") {
+            cfg.mode = "bench-prefill";
         } else if (flag == "--mode") {
             cfg.mode = value();
         } else if (flag == "--asr-model") cfg.asr_model = value();
@@ -681,6 +695,10 @@ Config config_from_args(int argc, char** argv) {
             float_flag(&cfg.chat_repeat_penalty);
         } else if (flag == "--chat-seed") {
             int_flag(&cfg.chat_seed);
+        } else if (flag == "--chat-ctx") {
+            int_flag(&cfg.chat_ctx);
+        } else if (flag == "--context-file") {
+            g_extras.context_file = value();
         } else if (flag == "--no-filler-guard") {
             // Judge the model itself: speak its text as generated.
             cfg.filler_guard = false;
